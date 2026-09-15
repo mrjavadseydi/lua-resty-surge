@@ -1,0 +1,20 @@
+# Command: /Users/javad/opt/openresty/luajit/bin/luajit -jv bench/jit_hot.lua
+# OpenResty 1.31.1.1, LuaJIT 2.1.ROLLING, Apple M4, Darwin arm64
+# No NYI aborts. "leaving loop in root trace" is LuaJIT outlining an inner
+# counted loop into its own trace and linking back.
+# sketch.lua:28 is the one-time CRC table build.
+# sketch.lua:48 is the request hash.
+
+[TRACE --- sketch.lua:28 -- leaving loop in root trace at sketch.lua:35]
+[TRACE   1 sketch.lua:28 loop]
+[TRACE   2 (1/1) sketch.lua:30 -> 1]
+[TRACE   3 (1/5) sketch.lua:30 -> 1]
+[TRACE   4 (1/6) sketch.lua:35 -> 1]
+[TRACE   5 (1/3) sketch.lua:35 -> 1]
+[TRACE   6 (2/1) sketch.lua:35 -> 1]
+[TRACE   7 (3/1) sketch.lua:35 -> 1]
+[TRACE   1 topk.lua:70 loop]
+[TRACE   2 sketch.lua:48 loop]
+[TRACE   3 (2/3) sketch.lua:55 -> 2]
+[TRACE   4 (2/0) sketch.lua:49 loop]
+[TRACE   5 (4/3) sketch.lua:55 -> 2]

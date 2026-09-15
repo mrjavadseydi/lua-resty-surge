@@ -1,0 +1,15 @@
+lua-resty-surge phase 2 microbench
+luajit LuaJIT 2.1.ROLLING
+runtime: openresty (ngx present)
+Darwin arm64
+Apple M4
+
+sketch add 4-byte                  27.3 ns/op      0.000 bytes/op
+sketch add 16-byte                 72.8 ns/op      0.000 bytes/op
+sketch query 4-byte                28.8 ns/op      0.000 bytes/op
+topk hit (key resident)            10.4 ns/op      0.000 bytes/op
+gcra check                          8.5 ns/op      0.000 bytes/op
+ngx.crc32_short 4-byte              5.3 ns/op      0.000 bytes/op
+ngx.crc32_short 16-byte            47.6 ns/op      0.000 bytes/op
+
+sketch ε 0.001327  δ 0.018316

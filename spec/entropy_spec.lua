@@ -1,0 +1,35 @@
+local entropy = require "resty.surge.entropy"
+
+describe("entropy", function()
+    it("is zero for a single bucket and one for a uniform distribution", function()
+        assert(entropy.normalized({}) == 0)
+        assert(entropy.normalized({ 0, 0 }) == 0)
+        assert(entropy.normalized({ 100 }) == 0)
+        assert(entropy.normalized({ 5, 0, 0 }) == 0)
+        local u = entropy.normalized({ 1, 1, 1, 1 })
+        assert(math.abs(u - 1) < 1e-9, u)
+        local two = entropy.normalized({ 4, 4 })
+        assert(math.abs(two - 1) < 1e-9, two)
+    end)
+
+    it("matches the known value of a 3:1 split", function()
+        -- H = -(0.75 log2 0.75 + 0.25 log2 0.25) ≈ 0.811278
+        -- n = 2, so H_norm = H.
+        local h = entropy.normalized({ 3, 1 })
+        assert(math.abs(h - 0.811278124459) < 1e-9, h)
+        local with_zero = entropy.normalized({ 3, 0, 1 })
+        assert(math.abs(with_zero - h) < 1e-12)
+    end)
+
+    it("freezes the EWMA while asked", function()
+        local tr = entropy.new_tracker(10, 1)
+        tr:update(1, false)
+        tr:update(1, false)
+        local before = tr:mean()
+        tr:update(0, true)
+        tr:update(0, true)
+        assert(tr:mean() == before)
+        tr:update(0, false)
+        assert(tr:mean() < before)
+    end)
+end)
