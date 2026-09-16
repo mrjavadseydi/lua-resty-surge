@@ -42,9 +42,14 @@ local function u32(x)
     return x
 end
 
-local function hash_pair(s)
+-- nbytes hashes a prefix of s (a /24 is the first 3 bytes) without
+-- allocating the prefix string.
+local function hash_pair(s, nbytes)
     local h1, h2 = 0xffffffff, 0xffffffff
     local n = #s
+    if nbytes and nbytes < n then
+        n = nbytes
+    end
     for i = 1, n do
         local b = byte(s, i)
         local i1 = band(bxor(h1, b), 0xff) + 1
@@ -129,13 +134,13 @@ local function raise(data, idx, limit)
     end
 end
 
-function _M.add(sk, key, weight)
+function _M.add(sk, key, weight, nbytes)
     weight = weight or 1
     if weight <= 0 then
         return
     end
 
-    local h1, h2 = hash_pair(key)
+    local h1, h2 = hash_pair(key, nbytes)
     local i0, i1, i2, i3 = buckets(sk, h1, h2)
     local data = sk.cur
     local est = min4(data, i0, i1, i2, i3)
@@ -150,8 +155,8 @@ function _M.add(sk, key, weight)
     sk.total = sk.total + weight
 end
 
-function _M.query(sk, key)
-    local h1, h2 = hash_pair(key)
+function _M.query(sk, key, nbytes)
+    local h1, h2 = hash_pair(key, nbytes)
     local i0, i1, i2, i3 = buckets(sk, h1, h2)
     return min4(sk.cur, i0, i1, i2, i3)
 end

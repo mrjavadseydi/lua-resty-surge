@@ -14,6 +14,9 @@
 -- The minimum slot is remembered. It is recomputed only when a key that
 -- currently holds that minimum is incremented off it or replaced.
 
+local byte = string.byte
+local sub = string.sub
+
 local ok_clear, table_clear = pcall(require, "table.clear")
 if not ok_clear then
     function table_clear(t)
@@ -80,7 +83,64 @@ function _M.new(k, gate)
         min_ties = 0,
         gate = gate,
         replacements = 0,
+        -- hash -> slot, for prefix keys that must not be allocated to be found
+        hashes = {},
     }
+end
+
+local function same_prefix(key, full, n)
+    if #key ~= n then
+        return false
+    end
+    for i = 1, n do
+        if byte(key, i) ~= byte(full, i) then
+            return false
+        end
+    end
+    return true
+end
+
+-- Prefix observe. `hash` is hash_pair(full, nbytes). The prefix string is
+-- created only when a new key is admitted; a hit compares bytes in place.
+-- `allow_new` is the sketch gate, already decided by the caller, so this
+-- table is constructed without its own gate.
+function _M.add_prefix(tk, full, nbytes, hash, weight, allow_new)
+    weight = weight or 1
+    if weight <= 0 then
+        return false
+    end
+
+    local hashes = tk.hashes
+    local idx = hashes[hash]
+    if idx then
+        local e = tk.slots[idx]
+        if e and same_prefix(e.key, full, nbytes) then
+            return _M.add(tk, e.key, weight)
+        end
+    end
+
+    local slots = tk.slots
+    for i = 1, tk.used do
+        local e = slots[i]
+        if same_prefix(e.key, full, nbytes) then
+            hashes[hash] = i
+            return _M.add(tk, e.key, weight)
+        end
+    end
+
+    if not allow_new then
+        return false
+    end
+
+    local key = sub(full, 1, nbytes)
+    local ok = _M.add(tk, key, weight)
+    if ok then
+        local slot = tk.index[key]
+        if slot then
+            hashes[hash] = slot
+        end
+    end
+    return ok
 end
 
 function _M.add(tk, key, weight)
@@ -160,6 +220,7 @@ function _M.reset(tk)
         e.error = 0
     end
     table_clear(tk.index)
+    table_clear(tk.hashes)
     tk.used = 0
     tk.min_i = 1
     tk.min_c = 0

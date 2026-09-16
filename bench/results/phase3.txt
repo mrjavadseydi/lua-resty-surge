@@ -1,0 +1,48 @@
+lua-resty-surge phase 3 http benchmark
+client: ab -n 20000 -c 32
+openresty: nginx version: openresty/1.31.1.1
+Darwin arm64
+Apple M4
+workers: 2
+
+=== bare (/bare) ===
+Failed requests:        0
+Requests per second:    27566.89 [#/sec] (mean)
+Time per request:       1.161 [ms] (mean)
+Time per request:       0.036 [ms] (mean, across all concurrent requests)
+percentiles (ms):
+  p50 1.075 ms
+  p99 2.253 ms
+  p100 3.269 ms
+
+=== lua (/lua) ===
+Failed requests:        0
+Requests per second:    29446.88 [#/sec] (mean)
+Time per request:       1.087 [ms] (mean)
+Time per request:       0.034 [ms] (mean, across all concurrent requests)
+percentiles (ms):
+  p50 1.071 ms
+  p99 1.253 ms
+  p100 1.688 ms
+
+=== normal (/open) ===
+Failed requests:        0
+Requests per second:    19466.27 [#/sec] (mean)
+Time per request:       1.644 [ms] (mean)
+Time per request:       0.051 [ms] (mean, across all concurrent requests)
+percentiles (ms):
+  p50 1.126 ms
+  p99 1.652 ms
+  p100 287.354 ms
+
+=== block (/blocked) ===
+Failed requests:        0
+Non-2xx responses:      20000
+Requests per second:    29907.70 [#/sec] (mean)
+Time per request:       1.070 [ms] (mean)
+Time per request:       0.033 [ms] (mean, across all concurrent requests)
+percentiles (ms):
+  p50 1.036 ms
+  p99 1.845 ms
+  p100 4.103 ms
+

@@ -40,6 +40,10 @@ local files = {
     "spec/baseline_spec.lua",
     "spec/entropy_spec.lua",
     "spec/gcra_spec.lua",
+    "spec/clientip_spec.lua",
+    "spec/decisions_spec.lua",
+    "spec/config_spec.lua",
+    "spec/sync_spec.lua",
 }
 
 for i = 1, #files do

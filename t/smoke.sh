@@ -1,0 +1,154 @@
+#!/bin/sh
+# Phase 3 smoke test. Starts OpenResty, checks the 3-line install, a block
+# that shows up on every worker, path allow, fail-open, and dry-run.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+OR=${OR:-$HOME/opt/openresty/bin/openresty}
+PORT=${PORT:-18181}
+PREFIX=${PREFIX:-/tmp/surge-smoke}
+DRY_PORT=${DRY_PORT:-18182}
+DRY_PREFIX=${DRY_PREFIX:-/tmp/surge-smoke-dry}
+
+if [ ! -x "$OR" ]; then
+    echo "openresty not found at $OR" >&2
+    exit 1
+fi
+
+write_conf() {
+    prefix=$1
+    port=$2
+    dry=$3
+    mkdir -p "$prefix/logs" "$prefix/conf"
+    cat > "$prefix/conf/nginx.conf" <<EOF
+worker_processes 2;
+error_log logs/error.log info;
+pid logs/nginx.pid;
+daemon off;
+env SURGE_DRY_RUN;
+
+events { worker_connections 1024; }
+
+http {
+    lua_package_path "$ROOT/lib/?.lua;;";
+    lua_shared_dict surge 64m;
+
+    init_worker_by_lua_block {
+        require("resty.surge").start({
+            allow = { "/health" },
+            dry_run = $dry,
+            advanced = { test_hooks = true, tick = 0.25 },
+        })
+    }
+
+    server {
+        listen 127.0.0.1:$port;
+
+        location = /_surge {
+            content_by_lua_block { require("resty.surge").status() }
+        }
+
+        location = /_block {
+            content_by_lua_block {
+                local ok, err = require("resty.surge")._publish({
+                    { cidr = "127.0.0.1/32", action = "block",
+                      reason = "manual", message = "manual block" },
+                })
+                ngx.say(ok and "published" or err)
+            }
+        }
+
+        location / {
+            access_by_lua_block { require("resty.surge").protect() }
+            content_by_lua_block { ngx.say("ok") }
+        }
+    }
+}
+EOF
+}
+
+stop() {
+    prefix=$1
+    if [ -f "$prefix/logs/nginx.pid" ]; then
+        kill "$(cat "$prefix/logs/nginx.pid")" 2>/dev/null || true
+        sleep 0.2
+    fi
+}
+
+wait_port() {
+    port=$1
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if curl -sf -o /dev/null "http://127.0.0.1:$port/_surge"; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    echo "server on $port did not come up" >&2
+    return 1
+}
+
+fail() {
+    echo "FAIL $1" >&2
+    echo "---- error log ----" >&2
+    tail -40 "$2/logs/error.log" >&2 || true
+    exit 1
+}
+
+rm -rf "$PREFIX" "$DRY_PREFIX"
+write_conf "$PREFIX" "$PORT" false
+"$OR" -p "$PREFIX" >/tmp/surge-smoke.out 2>&1 &
+trap 'stop "$PREFIX"; stop "$DRY_PREFIX"' EXIT
+wait_port "$PORT" || fail "startup" "$PREFIX"
+
+body=$(curl -sf "http://127.0.0.1:$PORT/") || fail "zero-config allow" "$PREFIX"
+echo "$body" | grep -q ok || fail "body was not ok: $body" "$PREFIX"
+
+status=$(curl -sf "http://127.0.0.1:$PORT/_surge") || fail "status" "$PREFIX"
+echo "$status" | grep -q '"mode":"normal"' || fail "status mode: $status" "$PREFIX"
+
+curl -sf "http://127.0.0.1:$PORT/_block" | grep -q published || fail "publish" "$PREFIX"
+sleep 0.8
+
+headers=$(curl -sS -D - -o /tmp/surge-body.txt "http://127.0.0.1:$PORT/login")
+echo "$headers" | grep -q "403" || fail "expected 403: $headers" "$PREFIX"
+echo "$headers" | grep -qi "X-Surge-Incident: srg-" || fail "incident header: $headers" "$PREFIX"
+echo "$headers" | grep -qi "X-Surge-Reason: manual" || fail "reason header: $headers" "$PREFIX"
+grep -q srg- /tmp/surge-body.txt || fail "body missing incident" "$PREFIX"
+
+json=$(curl -sS -H 'Accept: application/json' "http://127.0.0.1:$PORT/login")
+echo "$json" | grep -q incident || fail "json body: $json" "$PREFIX"
+
+health=$(curl -sf "http://127.0.0.1:$PORT/health") || fail "allowlisted path was blocked" "$PREFIX"
+echo "$health" | grep -q ok || fail "health body: $health" "$PREFIX"
+
+# Several hits so both workers are exercised after the snapshot tick.
+i=0
+while [ "$i" -lt 20 ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/again")
+    if [ "$code" != "403" ]; then
+        fail "worker missed the block ($code)" "$PREFIX"
+    fi
+    i=$((i + 1))
+done
+
+curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
+sleep 0.6
+grep -q "internal error" "$PREFIX/logs/error.log" || fail "fail-open was not logged" "$PREFIX"
+
+echo "block path ok"
+
+# Dry-run: same block, nothing denied, the would-be decision is logged.
+write_conf "$DRY_PREFIX" "$DRY_PORT" true
+SURGE_DRY_RUN=1 "$OR" -p "$DRY_PREFIX" >/tmp/surge-smoke-dry.out 2>&1 &
+wait_port "$DRY_PORT" || fail "dry startup" "$DRY_PREFIX"
+curl -sf "http://127.0.0.1:$DRY_PORT/_block" | grep -q published || fail "dry publish" "$DRY_PREFIX"
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DRY_PORT/")
+if [ "$code" != "200" ]; then
+    fail "dry-run denied the request ($code)" "$DRY_PREFIX"
+fi
+grep -q "dry-run would block" "$DRY_PREFIX/logs/error.log" || fail "dry-run did not log" "$DRY_PREFIX"
+
+echo "smoke ok"
