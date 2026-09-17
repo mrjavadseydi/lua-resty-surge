@@ -4,7 +4,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-OR=${OR:-$HOME/opt/openresty/bin/openresty}
+OR=${OR:-openresty}
 PORT=${PORT:-18201}
 PREFIX=${PREFIX:-/tmp/surge-bench}
 OUT="$ROOT/bench/results/phase3.txt"

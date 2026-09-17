@@ -4,14 +4,14 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-OR=${OR:-$HOME/opt/openresty/bin/openresty}
+OR=${OR:-openresty}
 PORT=${PORT:-18181}
 PREFIX=${PREFIX:-/tmp/surge-smoke}
 DRY_PORT=${DRY_PORT:-18182}
 DRY_PREFIX=${DRY_PREFIX:-/tmp/surge-smoke-dry}
 
-if [ ! -x "$OR" ]; then
-    echo "openresty not found at $OR" >&2
+if ! command -v "$OR" >/dev/null 2>&1; then
+    echo "openresty is not on PATH. From the repo root run: make smoke" >&2
     exit 1
 fi
 
