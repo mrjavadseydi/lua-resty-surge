@@ -43,6 +43,12 @@ M.relaxed = preset({
     hard_ip_rps = 2000,
     -- A heavy key under this rate is not an offender, whatever its share.
     min_key_rps = 50,
+    -- Global rate the limit stage enforces for one key. Each worker gets rate/workers.
+    limit_rps = 200,
+    -- At or above this confidence a stage change takes one tick.
+    confidence_skip = 0.95,
+    -- False until the challenge page exists: limit steps straight to block.
+    challenge_ready = false,
     sketch_width = 2048,
     sketch_depth = 4,
     -- Extra requests the limit stage may pass at once, per worker.
@@ -71,6 +77,9 @@ M.balanced = preset({
     entropy_rise = 0.20,
     hard_ip_rps = 1000,
     min_key_rps = 20,
+    limit_rps = 80,
+    confidence_skip = 0.9,
+    challenge_ready = false,
     sketch_width = 2048,
     sketch_depth = 4,
     gcra_burst = 10,
@@ -98,6 +107,9 @@ M.strict = preset({
     entropy_rise = 0.15,
     hard_ip_rps = 500,
     min_key_rps = 10,
+    limit_rps = 40,
+    confidence_skip = 0.8,
+    challenge_ready = false,
     sketch_width = 2048,
     sketch_depth = 4,
     gcra_burst = 10,

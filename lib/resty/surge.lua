@@ -14,16 +14,22 @@ local log = require "resty.surge.log"
 local sketch = require "resty.surge.sketch"
 local topk = require "resty.surge.topk"
 local sync = require "resty.surge.sync"
+local analyzer = require "resty.surge.analyzer"
+local gcra = require "resty.surge.gcra"
 
 local _M = { _VERSION = "0.1.0" }
 
 local agent_on = false
+local an
+local on_merged
 local started = false
 local cfg
 local state
 local box
 local allow4, allow6, allow_paths
 local sample_n = 0
+local tats = {}
+local sig = ""
 local err_n = 0
 local err_at = 0
 local err_last
@@ -81,6 +87,11 @@ local function install(snap)
     box.mode = snap.mode or "normal"
     box.sample = sample_of(box.mode)
     box.count = #snap.list
+    box.list = snap.list
+    box.rps = snap.rps
+    box.mean = snap.mean
+    box.sigma = snap.sigma
+    box.entropy = snap.entropy
 end
 
 local function gate_for(sk)
@@ -102,6 +113,7 @@ local function dim(slot, suffix, sk, tk)
         sketch = sk,
         topk_reset = topk.reset,
         sketch_rotate = sketch.rotate,
+        sketch_total = sketch.total,
     }
 end
 
@@ -136,6 +148,65 @@ local function make_state(dict, id)
     state.ip4, state.ip6 = state.dims[1], state.dims[2]
     state.sub4, state.sub6 = state.dims[3], state.dims[4]
     state.uri = state.dims[5]
+    state.analyze = on_merged
+end
+
+local function signature(snap)
+    local parts = { snap.mode or "" }
+    local list = snap.list or {}
+    for i = 1, #list do
+        local r = list[i]
+        parts[#parts + 1] = (r.incident or "")
+            .. (r.action or "")
+            .. (r.key or "")
+            .. (r.uri or "")
+    end
+    return table.concat(parts, "\0")
+end
+
+local function publish(snap)
+    local list = snap.list or {}
+    for i = 1, #list do
+        if not list[i].body_html then
+            respond.build(list[i], cfg.expose)
+        end
+    end
+    local blob = decisions.encode(snap)
+    local ok, err = state.dict:safe_set("dec", blob)
+    if not ok then
+        ngx.log(ngx.ERR, "surge: publish failed: ", err or "")
+        return nil, err
+    end
+    local ver, verr = state.dict:incr("v:dec", 1, 0)
+    if not ver then
+        return nil, verr
+    end
+    install(snap)
+    box.ver = ver
+    sig = signature(snap)
+    return true
+end
+
+on_merged = function(merged)
+    local snap = analyzer.run(an, merged, ngx.now(), box.list)
+    local kept = {}
+    local list = snap.list or {}
+    for i = 1, #list do
+        local r = list[i]
+        local banned = state.dict:get("supk:" .. (r.family or "") .. ":" .. (r.key or ""))
+        if r.manual or not banned then
+            kept[#kept + 1] = r
+        end
+    end
+    snap.list = kept
+    if signature(snap) ~= sig then
+        publish(snap)
+    end
+    box.rps = snap.rps
+    box.mean = snap.mean
+    box.sigma = snap.sigma
+    box.entropy = snap.entropy
+    box.warming = snap.warming
 end
 
 local function allowed_ip(family, bin)
@@ -249,6 +320,21 @@ local function protect_inner()
         -- request we actually serve, and the decision already remembers them.
         return dec
     end
+    -- Challenge has no page yet, so it throttles the same way limit does.
+    if dec and not cfg.dry_run
+        and (dec.action == "limit" or dec.action == "challenge")
+    then
+        local rate = (dec.rate or cfg.params.limit_rps) / (state.nworkers or 1)
+        if rate < 0.001 then
+            rate = 0.001
+        end
+        local interval, tau = gcra.params(rate, cfg.params.gcra_burst)
+        local allowed, tat = gcra.check(tats[dec.incident], ngx.now(), interval, tau)
+        if not allowed then
+            return dec, 429
+        end
+        tats[dec.incident] = tat
+    end
     if blocking then
         log.limited("dry:" .. dec.incident, ngx.NOTICE,
             "surge: dry-run would block " .. dec.incident
@@ -343,6 +429,8 @@ function _M.start(opts)
     end
 
     make_state(dict, id)
+    an = analyzer.new(cfg.params)
+    an.dry_run = cfg.dry_run
     started = true
 
     if id == 0 and #cfg.trusted == 0 then
@@ -366,12 +454,22 @@ function _M.protect()
     if not started or not state then
         return
     end
-    local ok, dec = xpcall(protect_inner, debug.traceback)
+    local ok, dec, status = xpcall(protect_inner, debug.traceback)
     if not ok then
         note_error(dec)
         return
     end
     if dec then
+        if status then
+            dec = {
+                incident = dec.incident,
+                reason_hdr = dec.reason_hdr,
+                body_json = dec.body_json,
+                body_html = dec.body_html,
+                close = false,
+                status = status,
+            }
+        end
         deny(dec)
     end
 end
@@ -393,12 +491,69 @@ function _M.status()
         ngx.print('{"error":"surge not started"}')
         return
     end
+
+    if ngx.req.get_method() == "POST" then
+        local unblock = ngx.var.arg_unblock
+        local blockip = ngx.var.arg_block
+        local ttl = tonumber(ngx.var.arg_ttl) or cfg.params.ttl_base
+        if unblock and unblock ~= "" then
+            local list = {}
+            local prev = box.list or {}
+            for i = 1, #prev do
+                local rec = prev[i]
+                if rec.incident == unblock then
+                    state.dict:set("supk:" .. rec.family .. ":" .. rec.key, 1, ttl)
+                else
+                    list[#list + 1] = rec
+                end
+            end
+            publish({
+                mode = box.mode, list = list,
+                rps = box.rps, mean = box.mean, sigma = box.sigma,
+            })
+            ngx.print('{"ok":true,"op":"unblock"}')
+            return
+        end
+        if blockip and blockip ~= "" then
+            local ok, err = _M._publish({
+                {
+                    cidr = blockip, action = "block", reason = "manual",
+                    message = "manual block", ttl = ttl,
+                },
+            })
+            if not ok then
+                ngx.status = 400
+                ngx.print(cjson.encode({ ok = false, error = err }))
+                return
+            end
+            ngx.print('{"ok":true,"op":"block"}')
+            return
+        end
+    end
+
     local dict = state and state.dict
+    local view = {}
+    local list = box.list or {}
+    for i = 1, #list do
+        local r = list[i]
+        view[i] = {
+            incident = r.incident,
+            action = r.action,
+            reason = r.reason,
+            message = r.message,
+            ttl = r.ttl,
+        }
+    end
     local body = {
         mode = box.mode,
         dry_run = cfg.dry_run,
+        warming = box.warming and true or false,
+        rps = box.rps,
+        baseline_mean = box.mean,
+        baseline_sigma = box.sigma,
+        entropy = box.entropy,
         version = box.ver,
-        decisions = box.count,
+        decisions = view,
         errors = err_at,
         worker = state and state.id or nil,
         shared_free = dict and dict:free_space() or nil,
@@ -407,14 +562,19 @@ function _M.status()
     ngx.print(cjson.encode(body))
 end
 
--- Install a decision list and publish it. Other workers apply it on the
--- next tick; this worker applies it now. Used by the status endpoint later
--- and by tests.
+-- Add manual decisions and publish. Kept across analyzer ticks because
+-- they are marked manual. This worker applies them now; the others on
+-- the next tick.
 function _M._publish(items, mode)
     if not started or not state then
         return nil, "surge not started"
     end
     local list = {}
+    local prev = box.list or {}
+    for i = 1, #prev do
+        list[#list + 1] = prev[i]
+    end
+    local now = ngx.now()
     for i = 1, #items do
         local it = items[i]
         local rule, err = clientip.parse_cidr(it.cidr)
@@ -422,7 +582,8 @@ function _M._publish(items, mode)
             return nil, err
         end
         seq = seq + 1
-        list[i] = {
+        local ttl = it.ttl or cfg.params.ttl_base
+        list[#list + 1] = {
             family = rule.v6 and "v6" or "v4",
             key = rule.bin,
             bits = rule.bits,
@@ -432,23 +593,20 @@ function _M._publish(items, mode)
             uri = it.uri,
             close = it.close and true or false,
             status = it.status or 403,
-            ttl = it.ttl or cfg.params.ttl_base,
+            ttl = ttl,
+            until_ts = now + ttl,
+            manual = true,
             incident = it.incident or string.format("srg-%x-%x", state.id or 0, seq),
         }
     end
-    local snap = { mode = mode or box.mode, list = list }
-    local blob = decisions.encode(snap)
-    local ok, err = state.dict:safe_set("dec", blob)
-    if not ok then
-        return nil, err
-    end
-    local ver, verr = state.dict:incr("v:dec", 1, 0)
-    if not ver then
-        return nil, verr
-    end
-    install(snap)
-    box.ver = ver
-    return true
+    return publish({
+        mode = mode or box.mode,
+        list = list,
+        rps = box.rps,
+        mean = box.mean,
+        sigma = box.sigma,
+        entropy = box.entropy,
+    })
 end
 
 return _M

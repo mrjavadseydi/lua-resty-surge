@@ -1,0 +1,244 @@
+-- Leader-only. Turns a merged top-K into a decision list.
+--
+-- A key offends when its share beats both the absolute floor and its own
+-- baseline share times the multiplier, and its rate beats min_key_rps.
+-- Share baselines freeze outside normal mode so a flood cannot become "normal".
+-- The first time a key is seen, its share is recorded and it is not judged;
+-- a one-tick spike of a brand new key does not escalate.
+-- URIs are never decisions. When one URI is most of the window, IP and
+-- subnet decisions are scoped to that path.
+
+local exp = math.exp
+local baseline = require "resty.surge.baseline"
+local entropy = require "resty.surge.entropy"
+local escalation = require "resty.surge.escalation"
+local messages = require "resty.surge.messages"
+
+local _M = {}
+
+local BLOCK_DIMS = {
+    i4 = { family = "v4", bits = 32 },
+    s4 = { family = "v4", bits = 24 },
+    s6 = { family = "v6", bits = 64 },
+}
+
+local function tracker(params)
+    return entropy.new_tracker(params.half_life, params.tick)
+end
+
+function _M.new(params)
+    return {
+        params = params,
+        baseline = baseline.new({
+            tick = params.tick,
+            half_life = params.half_life,
+            k_elev = params.k_elev,
+            k_attack = params.k_attack,
+            min_rps = params.min_rps,
+            cooldown = params.cooldown,
+            warmup = params.warmup,
+            max_growth_per_hour = params.max_growth_per_hour,
+        }),
+        entropy = {
+            s4 = tracker(params),
+            s6 = tracker(params),
+            u = tracker(params),
+        },
+        shares = {},
+        seen = {},
+        states = {},
+        seq = 0,
+        dry_run = false,
+    }
+end
+
+local function histogram(map, total)
+    local counts = {}
+    local sum = 0
+    for _, e in pairs(map or {}) do
+        if e.count > 0 then
+            counts[#counts + 1] = e.count
+            sum = sum + e.count
+        end
+    end
+    local other = (total or sum) - sum
+    if other > 0 then
+        counts[#counts + 1] = other
+    end
+    if #counts == 0 then
+        counts[1] = 0
+    end
+    return counts
+end
+
+local function top_key(map)
+    local best_k, best_c = nil, 0
+    for k, e in pairs(map or {}) do
+        if e.count > best_c then
+            best_c = e.count
+            best_k = k
+        end
+    end
+    return best_k, best_c
+end
+
+local function confidence_of(share, threshold, streak)
+    if threshold <= 0 then
+        threshold = 0.000001
+    end
+    local ratio = share / threshold
+    local c = ratio / (ratio + 1)
+    if streak and streak > 1 then
+        c = c + 0.05 * (streak - 1)
+    end
+    if c > 1 then
+        c = 1
+    end
+    return c
+end
+
+function _M.run(ctx, merged, now, previous)
+    local p = ctx.params
+    local totals = merged._totals or {}
+    local requests = (totals.i4 or 0) + (totals.i6 or 0)
+    local rps = 0
+    if p.tick > 0 then
+        rps = requests / p.tick
+    end
+
+    local frozen_before = ctx.baseline.mode ~= "normal"
+    local entropy_info = {}
+    local entropy_bad = false
+    for _, dim in ipairs({ "s4", "s6", "u" }) do
+        local h = entropy.normalized(histogram(merged[dim], totals[dim]))
+        local base = ctx.entropy[dim]:mean()
+        local delta = 0
+        if base then
+            delta = h - base
+            if delta <= -p.entropy_drop or delta >= p.entropy_rise then
+                entropy_bad = true
+            end
+        end
+        entropy_info[dim] = { h = h, base = base or h, delta = delta }
+    end
+
+    local mode = baseline.update(ctx.baseline, rps, now, entropy_bad)
+    local warming = ctx.baseline.warming
+    local frozen = mode ~= "normal"
+    for _, dim in ipairs({ "s4", "s6", "u" }) do
+        ctx.entropy[dim]:update(entropy_info[dim].h, frozen or warming)
+    end
+
+    local alpha = 1 - exp(-p.tick / p.half_life)
+    local _, _, sigma = baseline.lines(ctx.baseline)
+
+    local uri_scope = nil
+    local uri_total = totals.u or 0
+    local uri_key, uri_count = top_key(merged.u)
+    if uri_key and uri_total > 0 and (uri_count / uri_total) >= 0.4 then
+        local drop = entropy_info.u and entropy_info.u.delta or 0
+        if drop <= -p.entropy_drop or (uri_count / uri_total) >= 0.5 then
+            uri_scope = uri_key
+        end
+    end
+
+    local list = {}
+    if previous then
+        for i = 1, #previous do
+            local rec = previous[i]
+            if rec.manual and (not rec.until_ts or now < rec.until_ts) then
+                list[#list + 1] = rec
+            end
+        end
+    end
+
+    local function consider(dim, meta)
+        local map = merged[dim] or {}
+        local total = totals[dim] or 0
+        if total <= 0 then
+            return
+        end
+        for key, e in pairs(map) do
+            local id = dim .. "\0" .. key
+            local share = e.count / total
+            -- Judge against the baseline from before this tick. Seeding a
+            -- brand-new key during normal traffic is not an offense; the
+            -- next window is. During an attack the baseline stays put, so a
+            -- key we have never seen still has a floor of abs_share.
+            local base = ctx.shares[id]
+            local rate = 0
+            if p.tick > 0 then
+                rate = e.count / p.tick
+            end
+            local seeded_now = false
+            if not frozen and not warming then
+                if base == nil then
+                    ctx.shares[id] = share
+                    seeded_now = true
+                else
+                    ctx.shares[id] = base + alpha * (share - base)
+                end
+            end
+
+            if not seeded_now and not warming and rate > p.min_key_rps then
+                local floor = math.max(p.abs_share, (base or 0) * p.multiplier)
+                if share > floor then
+                    local st = ctx.states[id]
+                    if not st then
+                        ctx.seq = ctx.seq + 1
+                        st = escalation.new(string.format("srg-%x", ctx.seq))
+                        ctx.states[id] = st
+                    end
+                    local conf = confidence_of(share, floor, st.streak)
+                    local cap = ctx.dry_run and "observe" or nil
+                    escalation.step(st, true, conf, p, now, cap)
+                    local label = messages.label(key, meta.bits)
+                    local action = st.stage
+                    local rec = {
+                        family = meta.family,
+                        key = key,
+                        bits = meta.bits,
+                        action = action,
+                        reason = "heavy_hitter",
+                        message = messages.line(action, label, share, base or 0, rate, p.tick),
+                        uri = uri_scope,
+                        close = false,
+                        status = action == "limit" and 429 or 403,
+                        ttl = st.ttl > 0 and st.ttl or p.ttl_base,
+                        incident = st.incident,
+                        rate = p.limit_rps,
+                        share = share,
+                        confidence = conf,
+                    }
+                    if action ~= "observe" or (st.streak or 0) > 0 then
+                        list[#list + 1] = rec
+                    end
+                else
+                    local st = ctx.states[id]
+                    if st then
+                        escalation.step(st, false, 0, p, now, nil)
+                    end
+                end
+            end
+        end
+    end
+
+    if not warming then
+        consider("i4", BLOCK_DIMS.i4)
+        consider("s4", BLOCK_DIMS.s4)
+        consider("s6", BLOCK_DIMS.s6)
+    end
+
+    return {
+        mode = mode,
+        list = list,
+        rps = rps,
+        mean = ctx.baseline.mean,
+        sigma = sigma,
+        entropy = entropy_info,
+        warming = warming,
+        frozen = frozen_before,
+    }
+end
+
+return _M

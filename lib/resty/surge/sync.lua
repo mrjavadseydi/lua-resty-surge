@@ -54,9 +54,12 @@ local function r32(s, i)
     return a + b * 256 + c * 65536 + d * 16777216, i + 4
 end
 
-function _M.encode_topk(tk, scale)
+function _M.encode_topk(tk, scale, total)
     scale = scale or 1
-    local parts = { u16(scale), u16(tk.used) }
+    total = total or 0
+    -- total is the raw sketch count for the window. The leader multiplies
+    -- both the entries and this total by `scale`, so shares stay honest.
+    local parts = { u16(scale), u32(total), u16(tk.used) }
     local slots = tk.slots
     for i = 1, tk.used do
         local e = slots[i]
@@ -70,13 +73,15 @@ function _M.encode_topk(tk, scale)
 end
 
 function _M.decode_topk(blob)
-    if type(blob) ~= "string" or #blob < 4 then
+    if type(blob) ~= "string" or #blob < 8 then
         return nil
     end
     local scale, i = r16(blob, 1)
+    local total
+    total, i = r32(blob, i)
     local n
     n, i = r16(blob, i)
-    if not n then
+    if not n or not total then
         return nil
     end
     local items = {}
@@ -96,11 +101,11 @@ function _M.decode_topk(blob)
         end
         items[k] = { key = key, count = count * scale, error = errn * scale }
     end
-    return items, scale
+    return items, scale, total * scale
 end
 
-local function flush_one(dict, key, tk, scale)
-    local blob = _M.encode_topk(tk, scale)
+local function flush_one(dict, key, tk, scale, total)
+    local blob = _M.encode_topk(tk, scale, total)
     -- safe_set does not evict someone else's decision to make room.
     local ok, err = dict:safe_set(key, blob)
     if not ok then
@@ -146,11 +151,15 @@ local function lead(dict, pid, ttl)
     return false
 end
 
-local function merge_dim(dict, nworkers, suffix, into)
+local function merge_dim(dict, nworkers, suffix, into, totals)
+    local total = 0
     for id = 0, nworkers - 1 do
         local blob = dict:get("w" .. id .. ":" .. suffix)
         if blob then
-            local items = _M.decode_topk(blob)
+            local items, _, dim_total = _M.decode_topk(blob)
+            if dim_total then
+                total = total + dim_total
+            end
             if items then
                 for i = 1, #items do
                     local it = items[i]
@@ -171,6 +180,7 @@ local function merge_dim(dict, nworkers, suffix, into)
             end
         end
     end
+    totals[suffix] = total
 end
 
 function _M.tick(state)
@@ -179,7 +189,11 @@ function _M.tick(state)
     local dims = state.dims
     for i = 1, #dims do
         local d = dims[i]
-        local err = flush_one(dict, d.slot, d.topk, scale)
+        local total = 0
+        if d.sketch_total then
+            total = d.sketch_total(d.sketch) or 0
+        end
+        local err = flush_one(dict, d.slot, d.topk, scale, total)
         if err then
             ngx.log(ngx.ERR, "surge: flush ", d.slot, " failed: ", err)
         end
@@ -203,13 +217,18 @@ function _M.tick(state)
     end
 
     local merged = {}
+    local totals = {}
     for i = 1, #dims do
         local d = dims[i]
         local acc = {}
-        merge_dim(dict, state.nworkers, d.suffix, acc)
+        merge_dim(dict, state.nworkers, d.suffix, acc, totals)
         merged[d.suffix] = acc
     end
+    merged._totals = totals
     state.merged = merged
+    if state.analyze then
+        state.analyze(merged)
+    end
 end
 
 return _M

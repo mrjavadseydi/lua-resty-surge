@@ -133,6 +133,17 @@ while [ "$i" -lt 20 ]; do
     i=$((i + 1))
 done
 
+incident=$(echo "$headers" | awk 'tolower($1)=="x-surge-incident:" { print $2 }' | tr -d '\r')
+if [ -z "$incident" ]; then
+    fail "no incident to unblock" "$PREFIX"
+fi
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=$incident" | grep -q unblock || fail "unblock" "$PREFIX"
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
+if [ "$code" != "200" ]; then
+    fail "unblock did not clear the block ($code)" "$PREFIX"
+fi
+
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6
 grep -q "internal error" "$PREFIX/logs/error.log" || fail "fail-open was not logged" "$PREFIX"
