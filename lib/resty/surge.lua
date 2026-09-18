@@ -16,6 +16,8 @@ local topk = require "resty.surge.topk"
 local sync = require "resty.surge.sync"
 local analyzer = require "resty.surge.analyzer"
 local gcra = require "resty.surge.gcra"
+local feeds = require "resty.surge.feeds"
+local ipdb = require "resty.surge.ipdb"
 
 local _M = { _VERSION = "0.1.0" }
 
@@ -30,6 +32,14 @@ local allow4, allow6, allow_paths
 local sample_n = 0
 local tats = {}
 local sig = ""
+local shared
+local feed_rt = {
+    loaded = false,
+    sig = "",
+    next_check = 0,
+    next_fetch = {},
+    etag = {},
+}
 local err_n = 0
 local err_at = 0
 local err_last
@@ -308,7 +318,8 @@ local function protect_inner()
     if not family then
         return nil
     end
-    if allowed_ip(family, bin) or allowed_path() then
+    local good = family == "v6" and box.good6 or box.good4
+    if allowed_ip(family, bin) or allowed_path() or ipdb.hit(good, bin) then
         return nil
     end
 
@@ -344,6 +355,17 @@ local function protect_inner()
         end
     end
 
+    local rep = family == "v6" and box.rep6 or box.rep4
+    local listed = ipdb.hit(rep, bin)
+    if listed and not cfg.dry_run then
+        return listed
+    end
+    if listed then
+        log.limited("dry:" .. listed.incident, ngx.NOTICE,
+            "surge: dry-run would block " .. listed.incident
+            .. " " .. (listed.reason or ""))
+    end
+
     observe(family, bin)
     return nil
 end
@@ -376,10 +398,109 @@ local function deny(dec)
     return ngx.exit(status)
 end
 
+local function feed_groups()
+    local groups, parts = {}, {}
+    for i = 1, #cfg.feeds do
+        local d = feeds.describe(cfg.feeds[i])
+        local path = d.kind == "file" and d.path or feeds.list_path(cfg.feed_dir, d.name)
+        local cidrs, sum = feeds.read_list(path, d.format)
+        local err = feeds.read_note(cfg.feed_dir, d.name)
+        groups[#groups + 1] = {
+            name = d.name,
+            allow = d.allow,
+            cidrs = cidrs or {},
+            error = err,
+        }
+        parts[#parts + 1] = d.name .. ":" .. tostring(sum or 0) .. ":" .. (err or "")
+    end
+    return groups, table.concat(parts, "|")
+end
+
+local function apply_feeds()
+    if not cfg or #cfg.feeds == 0 or not box then
+        return
+    end
+    local groups, stamp = feed_groups()
+    if feed_rt.loaded and stamp == feed_rt.sig then
+        return
+    end
+    local db = ipdb.compile(groups, cfg.expose)
+    box.rep4, box.rep6 = db.block4, db.block6
+    box.good4, box.good6 = db.allow4, db.allow6
+    box.feed_report = db.report
+    feed_rt.sig = stamp
+    feed_rt.loaded = true
+end
+
+local function maybe_reload_feeds()
+    if not cfg or #cfg.feeds == 0 or not shared then
+        return
+    end
+    local ver = shared:get("feeds:version") or 0
+    local now = ngx.now()
+    if feed_rt.loaded and ver == box.feed_ver and now < feed_rt.next_check then
+        return
+    end
+    apply_feeds()
+    box.feed_ver = ver
+    feed_rt.next_check = now + (cfg.params.feed_poll or 30)
+end
+
+local function refresh_remote()
+    local changed = false
+    local now = ngx.now()
+    for i = 1, #cfg.feeds do
+        local d = feeds.describe(cfg.feeds[i])
+        if d.kind == "remote" and d.url then
+            local due = feed_rt.next_fetch[d.name]
+            if not due or now >= due then
+                local path = feeds.list_path(cfg.feed_dir, d.name)
+                local old = feeds.read_list(path, d.format)
+                local old_n = old and #old or 0
+                local body, ferr, res = feeds.fetch(d.url, { etag = feed_rt.etag[d.name] })
+                feed_rt.next_fetch[d.name] = now + d.interval
+                if res and res.headers and res.headers.etag then
+                    feed_rt.etag[d.name] = res.headers.etag
+                end
+                if ferr == "not modified" then
+                    -- The copy on disk stays the active list.
+                elseif not body then
+                    feeds.write_note(cfg.feed_dir, d.name, ferr or "fetch failed")
+                    ngx.log(ngx.ERR, "surge: feed ", d.name, " fetch failed: ", ferr or "")
+                else
+                    local status, why = feeds.apply_body(
+                        cfg.feed_dir, d.name, body, d.format, old_n)
+                    if not status then
+                        ngx.log(ngx.ERR, "surge: feed ", d.name, " rejected: ", why or "")
+                    else
+                        changed = true
+                        ngx.log(ngx.NOTICE, "surge: feed ", d.name, " updated, ",
+                            why, " networks")
+                    end
+                end
+            end
+        end
+    end
+    if changed then
+        shared:incr("feeds:version", 1, 0)
+    end
+end
+
+local function on_feed_timer(premature)
+    if premature then
+        return
+    end
+    local ok, err = xpcall(refresh_remote, debug.traceback)
+    if not ok then
+        ngx.log(ngx.ERR, "surge: feed refresh failed: ", err)
+    end
+end
+
 local function on_tick(premature)
     if premature then
         return
     end
+    maybe_reload_feeds()
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
@@ -413,17 +534,38 @@ function _M.start(opts)
         error("surge: url feeds need the privileged agent. Add this in the http {} block:\n"
             .. "    init_by_lua_block { require(\"resty.surge\").init() }")
     end
+    if config.needs_agent(cfg.feeds) and not pcall(require, "resty.http") then
+        error("surge: url feeds need lua-resty-http. Install it with: "
+            .. "opm get pintsized/lua-resty-http")
+    end
 
     local dict = config.open_dict(cfg.dict)
+    shared = dict
     box = empty_box()
     box.sample = cfg.params.sample
     allow4 = cfg.allow4
     allow6 = cfg.allow6
     allow_paths = cfg.paths
+    if #cfg.feeds > 0 then
+        feeds.ensure_dir(cfg.feed_dir)
+        apply_feeds()
+    end
 
     local id = ngx.worker.id()
     if id == nil then
-        -- Privileged agent. It does not serve requests and has no worker id.
+        -- Privileged agent. Downloads run here because workers may be
+        -- unprivileged and must not all hit the feed URLs.
+        local ptype = require("ngx.process").type()
+        if ptype == "privileged agent" and config.needs_agent(cfg.feeds) then
+            local ok, err = ngx.timer.at(0, on_feed_timer)
+            if not ok then
+                error("surge: feed timer failed: " .. (err or ""))
+            end
+            ok, err = ngx.timer.every(60, on_feed_timer)
+            if not ok then
+                error("surge: feed timer failed: " .. (err or ""))
+            end
+        end
         started = true
         return
     end
@@ -558,6 +700,7 @@ function _M.status()
         worker = state and state.id or nil,
         shared_free = dict and dict:free_space() or nil,
         shared_capacity = dict and dict:capacity() or nil,
+        feeds = box.feed_report,
     }
     ngx.print(cjson.encode(body))
 end

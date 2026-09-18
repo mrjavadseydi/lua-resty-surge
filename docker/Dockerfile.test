@@ -28,7 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN cpanm --notest Test::Nginx
 
-RUN luarocks install busted 2>&1 | tail -2
+RUN luarocks install busted 2>&1 | tail -2 \
+    && luarocks install lua-resty-http 2>&1 | tail -2 \
+    && luarocks install lua-resty-ipmatcher 2>&1 | tail -2
 
 # wrk links against the image's LuaJIT. OpenResty keeps those headers under
 # include/luajit-2.1/; wrk looks for <prefix>/include.
@@ -43,7 +45,10 @@ RUN git clone --depth=1 https://github.com/wg/wrk.git /tmp/wrk \
 ENV PATH=/usr/local/openresty/luajit/bin:/usr/local/openresty/bin:/usr/local/openresty/nginx/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LD_LIBRARY_PATH=/usr/local/openresty/luajit/lib
 ENV TEST_NGINX_BINARY=/usr/local/openresty/nginx/sbin/nginx
-ENV LUA_PATH=/work/lib/?.lua;/work/lib/?/init.lua;./?.lua;
+# `;;` keeps OpenResty's bundled lualib. The luajit share path is where
+# luarocks put lua-resty-http and lua-resty-ipmatcher.
+ENV LUA_PATH=/work/lib/?.lua;/work/lib/?/init.lua;/usr/local/openresty/luajit/share/lua/5.1/?.lua;/usr/local/openresty/luajit/share/lua/5.1/?/init.lua;;
+ENV LUA_CPATH=/usr/local/openresty/luajit/lib/lua/5.1/?.so;;
 
 WORKDIR /work
 CMD ["/bin/bash"]

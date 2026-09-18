@@ -7,7 +7,7 @@ IMAGE ?= lua-resty-surge/harness:latest
 OPENRESTY_IMAGE ?= openresty/openresty:1.31.1.1-3-jammy
 RUN := docker run --rm -v $(CURDIR):/work -w /work $(IMAGE)
 
-.PHONY: image image-if-missing test test-unit smoke bench microbench shell version
+.PHONY: image image-if-missing test test-unit smoke feeds bench microbench radix shell version
 
 image:
 	docker build -t $(IMAGE) --build-arg OPENRESTY_IMAGE=$(OPENRESTY_IMAGE) -f docker/Dockerfile.test docker
@@ -24,13 +24,19 @@ test-unit: | image-if-missing
 smoke: | image-if-missing
 	$(RUN) sh t/smoke.sh
 
+feeds: | image-if-missing
+	$(RUN) sh t/feeds.sh
+
 bench: | image-if-missing
 	$(RUN) sh bench/protect.sh
+
+radix: | image-if-missing
+	$(RUN) resty bench/radix.lua
 
 microbench: | image-if-missing
 	$(RUN) resty bench/microbench.lua
 
-test: test-unit smoke
+test: test-unit smoke feeds
 
 shell: | image-if-missing
 	docker run --rm -it -v $(CURDIR):/work -w /work $(IMAGE)

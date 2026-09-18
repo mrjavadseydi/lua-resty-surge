@@ -54,6 +54,8 @@ M.relaxed = preset({
     -- Extra requests the limit stage may pass at once, per worker.
     gcra_burst = 10,
     test_hooks = false,
+    -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
+    feed_poll = 30,
 })
 
 M.balanced = preset({
@@ -84,6 +86,8 @@ M.balanced = preset({
     sketch_depth = 4,
     gcra_burst = 10,
     test_hooks = false,
+    -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
+    feed_poll = 30,
 })
 
 M.strict = preset({
@@ -114,6 +118,8 @@ M.strict = preset({
     sketch_depth = 4,
     gcra_burst = 10,
     test_hooks = false,
+    -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
+    feed_poll = 30,
 })
 
 function M.copy(name)

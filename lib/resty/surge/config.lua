@@ -40,10 +40,16 @@ local function one_feed(entry)
     end
     local name = entry.name or "custom"
     if entry.url and entry.url ~= "" then
-        return { kind = "remote", name = name, url = entry.url }
+        return {
+            kind = "remote", name = name, url = entry.url,
+            format = entry.format, allow = entry.allow,
+        }
     end
     if entry.path and entry.path ~= "" then
-        return { kind = "file", name = name, path = entry.path }
+        return {
+            kind = "file", name = name, path = entry.path,
+            format = entry.format, allow = entry.allow,
+        }
     end
     return nil, 'surge: custom feed "' .. name .. '" needs a path or url'
 end
@@ -141,6 +147,10 @@ function _M.parse(opts)
     if type(dict) ~= "string" or dict == "" then
         error("surge: dict must be the lua_shared_dict name")
     end
+    local feed_dir = opts.feed_dir or "/tmp/surge-feeds"
+    if type(feed_dir) ~= "string" or feed_dir == "" then
+        error("surge: feed_dir must be a directory path")
+    end
 
     return {
         mode = mode,
@@ -153,6 +163,7 @@ function _M.parse(opts)
         paths = paths,
         trusted = trusted,
         feeds = feeds,
+        feed_dir = feed_dir,
         dict = dict,
         test_hooks = params.test_hooks and true or false,
     }

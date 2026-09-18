@@ -1,0 +1,5 @@
+lua-resty-surge phase 5 radix bench
+networks 4000  lookups 200000
+runtime: openresty
+binary trie                      62.9 ns/lookup
+lua-resty-ipmatcher              46.5 ns/lookup
