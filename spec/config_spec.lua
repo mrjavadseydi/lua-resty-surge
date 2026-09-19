@@ -46,4 +46,52 @@ describe("config", function()
         local remote = config.parse({ feeds = { "tor_exits" } })
         assert(config.needs_agent(remote.feeds))
     end)
+
+    it("rejects duplicate feed names", function()
+        local ok, err = pcall(config.parse, {
+            feeds = {
+                { url = "https://a.example/list" },
+                { url = "https://b.example/list" },
+            },
+        })
+        assert(not ok)
+        assert(err:find('duplicate feed name "custom"', 1, true))
+
+        ok, err = pcall(config.parse, {
+            feeds = {
+                { name = "office", path = "/tmp/a.txt" },
+                { name = "office", path = "/tmp/b.txt" },
+            },
+        })
+        assert(not ok)
+        assert(err:find('duplicate feed name "office"', 1, true))
+
+        ok, err = pcall(config.parse, { feeds = { "tor_exits", "tor_exits" } })
+        assert(not ok)
+        assert(err:find('duplicate feed name "tor_exits"', 1, true))
+
+        local cfg = config.parse({
+            feeds = {
+                { name = "a", url = "https://a.example/list" },
+                { name = "b", url = "https://b.example/list" },
+            },
+        })
+        assert(#cfg.feeds == 2)
+    end)
+
+    it("parses trusted proxies and the client header name", function()
+        local cfg = config.parse({
+            trusted_proxies = { "10.0.0.0/8" },
+            client_header = "CF-Connecting-IP",
+        })
+        assert(#cfg.trusted == 1)
+        assert(cfg.client_header == "CF-Connecting-IP")
+        assert(cfg.client_var == "http_cf_connecting_ip")
+        local defaults = config.parse({})
+        assert(#defaults.trusted == 0)
+        assert(defaults.client_var == "http_x_forwarded_for")
+        local ok, err = pcall(config.parse, { client_header = "Bad Header" })
+        assert(not ok)
+        assert(err:find("client_header", 1, true))
+    end)
 end)

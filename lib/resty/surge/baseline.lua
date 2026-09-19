@@ -99,7 +99,10 @@ function _M.update(b, rps, now, entropy_attack)
     -- otherwise freeze the baseline before it exists.
     local ready = b.seeded and not warming
     local elev_line, atk_line, sigma = _M.lines(b)
-    local want_attack = ready and (entropy_attack == true or rps > atk_line)
+    -- A handful of sampled requests makes entropy swing on its own.
+    -- Ignore that signal until the rate clears the same floor as a real spike.
+    local entropy_ok = entropy_attack == true and rps >= b.min_rps
+    local want_attack = ready and (entropy_ok or rps > atk_line)
     local want_elev = ready and (rps > elev_line)
 
     local mode = b.mode
@@ -150,6 +153,47 @@ function _M.update(b, rps, now, entropy_attack)
         attack = atk_line,
         warming = warming,
         frozen = mode ~= "normal",
+    }
+end
+
+function _M.export(b)
+    local s = _M.snapshot(b)
+    local function field(v)
+        if v == nil then
+            return "-"
+        end
+        return tostring(v)
+    end
+    return table.concat({
+        field(s.mean), field(s.var), s.mode or "normal",
+        field(s.started_at), field(s.below_since), field(s.updated_at),
+        s.seeded and "1" or "0",
+    }, "\n")
+end
+
+function _M.import(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+    local mean, var, mode, started, below, updated, seeded =
+        text:match("([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)")
+    if not mean then
+        return nil
+    end
+    local function num(v)
+        if not v or v == "-" or v == "" then
+            return nil
+        end
+        return tonumber(v)
+    end
+    return {
+        mean = tonumber(mean) or 0,
+        var = tonumber(var) or 0,
+        mode = mode,
+        started_at = num(started),
+        below_since = num(below),
+        updated_at = num(updated),
+        seeded = seeded == "1",
     }
 end
 

@@ -45,6 +45,7 @@ function _M.new(params)
             u = tracker(params),
         },
         shares = {},
+        share_at = {},
         seen = {},
         states = {},
         seq = 0,
@@ -142,17 +143,102 @@ function _M.run(ctx, merged, now, previous)
         end
     end
 
-    local list = {}
+    local emitted = {}
+    local manual_ids = {}
+    local from_prev = {}
+
+    local function dim_of(rec)
+        if rec.bits == 24 then
+            return "s4"
+        end
+        if rec.bits == 64 or rec.family == "v6" then
+            return "s6"
+        end
+        return "i4"
+    end
+
+    local function adopt(rec)
+        local id = dim_of(rec) .. "\0" .. rec.key
+        local st = ctx.states[id]
+        local rec_until = rec.until_ts or 0
+        if not st then
+            st = escalation.new(rec.incident)
+            ctx.states[id] = st
+            st.stage = rec.action or st.stage
+            st.ttl = rec.ttl or st.ttl
+            st.until_ts = rec_until
+            st.last = rec
+        elseif rec_until > (st.until_ts or 0) then
+            -- A snapshot must not shorten a TTL this process already extended.
+            st.until_ts = rec_until
+            st.ttl = rec.ttl or st.ttl
+            st.last = rec
+            if rec.action and rec.action ~= "observe" then
+                st.stage = rec.action
+            end
+        end
+        st.last_seen = st.last_seen or now
+        return id, st
+    end
+
     if previous then
         for i = 1, #previous do
             local rec = previous[i]
-            if rec.manual and (not rec.until_ts or now < rec.until_ts) then
-                list[#list + 1] = rec
+            local alive = not rec.until_ts or now < rec.until_ts
+            if alive and (rec.manual or (rec.action and rec.action ~= "observe")) then
+                -- Kept only while the published snapshot still carries it.
+                -- An unblock removes the record; leader memory must not put it back.
+                local id = adopt(rec)
+                from_prev[id] = true
+                if rec.manual then
+                    manual_ids[id] = true
+                    emitted[id] = rec
+                end
             end
         end
     end
 
-    local function consider(dim, meta)
+    local function emit(id, st, key, meta, share, base, rate, reason)
+        local action = st.stage
+        if action == "observe" and (st.streak or 0) == 0 then
+            return
+        end
+        local rec = {
+            family = meta.family,
+            key = key,
+            bits = meta.bits,
+            action = action,
+            reason = reason,
+            message = messages.line(action, messages.label(key, meta.bits),
+                share, base or 0, rate, p.tick),
+            uri = uri_scope,
+            close = false,
+            status = (action == "limit" or action == "challenge") and 429 or 403,
+            ttl = st.ttl > 0 and st.ttl or p.ttl_base,
+            until_ts = st.until_ts,
+            incident = st.incident,
+            rate = p.limit_rps,
+            share = share,
+            confidence = st.confidence,
+        }
+        st.last = rec
+        emitted[id] = rec
+    end
+
+    local function hold(id, st)
+        if st.stage ~= "observe" and st.last
+            and (not st.until_ts or now < st.until_ts)
+        then
+            emitted[id] = st.last
+        else
+            emitted[id] = nil
+            st.last = nil
+        end
+    end
+
+    local touched = {}
+
+    local function consider(dim, meta, hard_only)
         local map = merged[dim] or {}
         local total = totals[dim] or 0
         if total <= 0 then
@@ -160,18 +246,23 @@ function _M.run(ctx, merged, now, previous)
         end
         for key, e in pairs(map) do
             local id = dim .. "\0" .. key
+            touched[id] = true
             local share = e.count / total
-            -- Judge against the baseline from before this tick. Seeding a
-            -- brand-new key during normal traffic is not an offense; the
-            -- next window is. During an attack the baseline stays put, so a
-            -- key we have never seen still has a floor of abs_share.
             local base = ctx.shares[id]
             local rate = 0
             if p.tick > 0 then
                 rate = e.count / p.tick
             end
+            ctx.share_at[id] = now
+            local st = ctx.states[id]
+            if st then
+                st.last_seen = now
+            end
+
+            -- Judge against the baseline from before this tick. Seeding a
+            -- brand-new key during normal traffic is not an offense.
             local seeded_now = false
-            if not frozen and not warming then
+            if not hard_only and not frozen and not warming then
                 if base == nil then
                     ctx.shares[id] = share
                     seeded_now = true
@@ -180,53 +271,93 @@ function _M.run(ctx, merged, now, previous)
                 end
             end
 
-            if not seeded_now and not warming and rate > p.min_key_rps then
+            if manual_ids[id] then
+                -- operator block wins over a fresh automatic one
+            elseif hard_only and dim == "i4" and p.hard_ip_rps
+                and rate > p.hard_ip_rps
+            then
+                -- Warmup has no share baseline. Cap one IPv4 address, not a
+                -- subnet total: a /24 over the same number is a busy NAT.
+                if not st then
+                    ctx.seq = ctx.seq + 1
+                    st = escalation.new(string.format("srg-%x", ctx.seq))
+                    ctx.states[id] = st
+                end
+                if st.stage == "observe" then
+                    st.stage = "limit"
+                    st.ttl = p.ttl_base
+                    st.until_ts = now + st.ttl
+                    st.streak = 0
+                end
+                st.last_seen = now
+                emit(id, st, key, meta, share, base, rate, "hard_ip")
+            elseif not hard_only and not seeded_now and not warming
+                and rate > p.min_key_rps
+            then
                 local floor = math.max(p.abs_share, (base or 0) * p.multiplier)
                 if share > floor then
-                    local st = ctx.states[id]
                     if not st then
                         ctx.seq = ctx.seq + 1
                         st = escalation.new(string.format("srg-%x", ctx.seq))
                         ctx.states[id] = st
                     end
+                    -- A decision that already expired must climb again.
+                    if st.stage ~= "observe" and st.until_ts and now >= st.until_ts then
+                        st.stage = "observe"
+                        st.streak = 0
+                        st.ttl = 0
+                    end
                     local conf = confidence_of(share, floor, st.streak)
                     local cap = ctx.dry_run and "observe" or nil
                     escalation.step(st, true, conf, p, now, cap)
-                    local label = messages.label(key, meta.bits)
-                    local action = st.stage
-                    local rec = {
-                        family = meta.family,
-                        key = key,
-                        bits = meta.bits,
-                        action = action,
-                        reason = "heavy_hitter",
-                        message = messages.line(action, label, share, base or 0, rate, p.tick),
-                        uri = uri_scope,
-                        close = false,
-                        status = action == "limit" and 429 or 403,
-                        ttl = st.ttl > 0 and st.ttl or p.ttl_base,
-                        incident = st.incident,
-                        rate = p.limit_rps,
-                        share = share,
-                        confidence = conf,
-                    }
-                    if action ~= "observe" or (st.streak or 0) > 0 then
-                        list[#list + 1] = rec
-                    end
-                else
-                    local st = ctx.states[id]
-                    if st then
-                        escalation.step(st, false, 0, p, now, nil)
-                    end
+                    emit(id, st, key, meta, share, base, rate, "heavy_hitter")
+                elseif st then
+                    escalation.step(st, false, 0, p, now, nil)
+                    hold(id, st)
                 end
+            elseif st then
+                escalation.step(st, false, 0, p, now, nil)
+                hold(id, st)
             end
         end
     end
 
-    if not warming then
-        consider("i4", BLOCK_DIMS.i4)
-        consider("s4", BLOCK_DIMS.s4)
-        consider("s6", BLOCK_DIMS.s6)
+    consider("i4", BLOCK_DIMS.i4, warming)
+    consider("s4", BLOCK_DIMS.s4, warming)
+    consider("s6", BLOCK_DIMS.s6, warming)
+
+    -- Keys we blocked are absent from the top-K. Step them anyway so the
+    -- TTL can expire them back to observe, and keep publishing until then.
+    local idle_after = p.half_life or 600
+    for id, st in pairs(ctx.states) do
+        if not touched[id] then
+            if from_prev[id] then
+                escalation.step(st, false, 0, p, now, nil)
+                hold(id, st)
+            else
+                ctx.states[id] = nil
+                st = nil
+            end
+        end
+        if st and st.stage == "observe"
+            and st.last_seen and now - st.last_seen > idle_after
+        then
+            ctx.states[id] = nil
+        end
+    end
+    for id, seen_at in pairs(ctx.share_at) do
+        if now - seen_at > idle_after and not ctx.states[id] then
+            ctx.shares[id] = nil
+            ctx.seen[id] = nil
+            ctx.share_at[id] = nil
+        end
+    end
+
+    local list = {}
+    for _, rec in pairs(emitted) do
+        if rec then
+            list[#list + 1] = rec
+        end
     end
 
     return {

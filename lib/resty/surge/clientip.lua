@@ -162,6 +162,96 @@ function _M.identity(bin)
     return "v6", bin
 end
 
+function _M.peer_trusted(bin, rules)
+    for i = 1, #rules do
+        if _M.matches(rules[i], bin) then
+            return true
+        end
+    end
+    return false
+end
+
+-- One X-Forwarded-For token: "1.2.3.4", "1.2.3.4:443", or "[2001:db8::1]:443".
+function _M.parse_ip(token)
+    if type(token) ~= "string" then
+        return nil
+    end
+    token = token:match("^%s*(.-)%s*$")
+    if not token or token == "" then
+        return nil
+    end
+    if token:sub(1, 1) == "[" then
+        token = token:match("^%[([^%]]+)%]")
+        if not token then
+            return nil
+        end
+    else
+        local v4 = token:match("^(%d+%.%d+%.%d+%.%d+):%d+$")
+        if v4 then
+            token = v4
+        end
+    end
+    local rule = _M.parse_cidr(token)
+    if not rule then
+        return nil
+    end
+    return rule.v6 and "v6" or "v4", rule.bin
+end
+
+-- Rightmost address that is not itself a trusted proxy. Entries further
+-- left are the client-supplied prefix and are ignored. Only the last
+-- `limit` hops are examined.
+function _M.client_from_xff(header, trusted, limit)
+    if type(header) ~= "string" or header == "" then
+        return nil
+    end
+    limit = limit or 8
+    local parts = {}
+    for token in header:gmatch("[^,]+") do
+        parts[#parts + 1] = token
+    end
+    local start_at = 1
+    if #parts > limit then
+        start_at = #parts - limit + 1
+    end
+    local leftmost = nil
+    for i = #parts, start_at, -1 do
+        local fam, bin = _M.parse_ip(parts[i])
+        if fam then
+            leftmost = { fam, bin }
+            if not _M.peer_trusted(bin, trusted) then
+                return fam, bin
+            end
+        end
+    end
+    if leftmost then
+        return leftmost[1], leftmost[2]
+    end
+    return nil
+end
+
+-- Peer address, unless that peer is a trusted proxy and nginx real_ip has
+-- not already replaced it. opts.xff is ignored for every other request so
+-- the header is not part of the normal path.
+function _M.client_addr(peer_bin, opts)
+    opts = opts or {}
+    local family, bin = _M.identity(peer_bin)
+    if not family then
+        return nil
+    end
+    local trusted = opts.trusted
+    if not trusted or #trusted == 0 or opts.realip_rewritten
+        or not _M.peer_trusted(bin, trusted)
+    then
+        return family, bin
+    end
+    local fam, b2 = _M.client_from_xff(opts.xff, trusted, opts.limit or 8)
+    if not fam then
+        return family, bin
+    end
+    return fam, b2
+end
+
 -- Allow entries are CIDRs or path prefixes (leading /).
 function _M.allow_rule(spec)
     if type(spec) ~= "string" or spec == "" then

@@ -15,6 +15,7 @@ local sketch = require "resty.surge.sketch"
 local topk = require "resty.surge.topk"
 local sync = require "resty.surge.sync"
 local analyzer = require "resty.surge.analyzer"
+local baseline = require "resty.surge.baseline"
 local gcra = require "resty.surge.gcra"
 local feeds = require "resty.surge.feeds"
 local ipdb = require "resty.surge.ipdb"
@@ -32,6 +33,7 @@ local allow4, allow6, allow_paths
 local sample_n = 0
 local tats = {}
 local sig = ""
+local baseline_saved = ""
 local shared
 local feed_rt = {
     loaded = false,
@@ -170,6 +172,8 @@ local function signature(snap)
             .. (r.action or "")
             .. (r.key or "")
             .. (r.uri or "")
+            .. (r.manual and "m" or "")
+            .. tostring(math.floor(r.until_ts or 0))
     end
     return table.concat(parts, "\0")
 end
@@ -198,6 +202,16 @@ local function publish(snap)
 end
 
 on_merged = function(merged)
+    -- Another leader may have saved a newer clock while this worker waited
+    -- on the lease. Continue from that snapshot instead of overwriting it.
+    local saved = state.dict:get("baseline")
+    if type(saved) == "string" and saved ~= baseline_saved then
+        local prior = baseline.import(saved)
+        if prior then
+            baseline.restore(an.baseline, prior, ngx.now())
+            baseline_saved = saved
+        end
+    end
     local snap = analyzer.run(an, merged, ngx.now(), box.list)
     local kept = {}
     local list = snap.list or {}
@@ -217,6 +231,17 @@ on_merged = function(merged)
     box.sigma = snap.sigma
     box.entropy = snap.entropy
     box.warming = snap.warming
+    -- The next start() continues this clock. Otherwise every reload spends
+    -- the whole warmup with no automatic decisions.
+    local text = baseline.export(an.baseline)
+    if text ~= baseline_saved then
+        local ok, berr = state.dict:safe_set("baseline", text)
+        if ok then
+            baseline_saved = text
+        else
+            ngx.log(ngx.ERR, "surge: baseline save failed: ", berr or "")
+        end
+    end
 end
 
 local function allowed_ip(family, bin)
@@ -314,7 +339,25 @@ local function protect_inner()
     if not raw then
         return nil
     end
-    local family, bin = clientip.identity(raw)
+    -- Header read only for a trusted peer that real_ip has not already
+    -- rewritten. Everyone else stays on the one binary address.
+    local xff, rewritten
+    if cfg.trusted[1] then
+        local fam0, bin0 = clientip.identity(raw)
+        if fam0 and clientip.peer_trusted(bin0, cfg.trusted) then
+            local orig = ngx.var.realip_remote_addr
+            local cur = ngx.var.remote_addr
+            rewritten = orig and orig ~= "" and cur and orig ~= cur or false
+            if not rewritten then
+                xff = ngx.var[cfg.client_var]
+            end
+        end
+    end
+    local family, bin = clientip.client_addr(raw, {
+        trusted = cfg.trusted,
+        xff = xff,
+        realip_rewritten = rewritten,
+    })
     if not family then
         return nil
     end
@@ -403,7 +446,10 @@ local function feed_groups()
     for i = 1, #cfg.feeds do
         local d = feeds.describe(cfg.feeds[i])
         local path = d.kind == "file" and d.path or feeds.list_path(cfg.feed_dir, d.name)
-        local cidrs, sum = feeds.read_list(path, d.format)
+        -- A saved remote list is always plain CIDR lines; d.format only
+        -- describes the source document.
+        local cidrs, sum = feeds.read_list(path,
+            d.kind == "file" and d.format or "cidr")
         local err = feeds.read_note(cfg.feed_dir, d.name)
         groups[#groups + 1] = {
             name = d.name,
@@ -455,13 +501,10 @@ local function refresh_remote()
             local due = feed_rt.next_fetch[d.name]
             if not due or now >= due then
                 local path = feeds.list_path(cfg.feed_dir, d.name)
-                local old = feeds.read_list(path, d.format)
+                local old = feeds.read_list(path, "cidr")
                 local old_n = old and #old or 0
                 local body, ferr, res = feeds.fetch(d.url, { etag = feed_rt.etag[d.name] })
                 feed_rt.next_fetch[d.name] = now + d.interval
-                if res and res.headers and res.headers.etag then
-                    feed_rt.etag[d.name] = res.headers.etag
-                end
                 if ferr == "not modified" then
                     -- The copy on disk stays the active list.
                 elseif not body then
@@ -470,7 +513,11 @@ local function refresh_remote()
                 else
                     local status, why = feeds.apply_body(
                         cfg.feed_dir, d.name, body, d.format, old_n)
-                    if not status then
+                    local stored = status == "updated"
+                    -- ETag is recorded only after the list is on disk. A 304
+                    -- on the next fetch would otherwise freeze a missing file.
+                    feeds.remember_etag(feed_rt.etag, d.name, res, stored)
+                    if not stored then
                         ngx.log(ngx.ERR, "surge: feed ", d.name, " rejected: ", why or "")
                     else
                         changed = true
@@ -573,6 +620,14 @@ function _M.start(opts)
     make_state(dict, id)
     an = analyzer.new(cfg.params)
     an.dry_run = cfg.dry_run
+    local saved = dict:get("baseline")
+    if type(saved) == "string" then
+        local snap = baseline.import(saved)
+        if snap then
+            baseline.restore(an.baseline, snap, ngx.now())
+            baseline_saved = saved
+        end
+    end
     started = true
 
     if id == 0 and #cfg.trusted == 0 then

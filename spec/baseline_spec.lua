@@ -118,14 +118,46 @@ describe("ewma baseline", function()
         assert(b.warming == true)
     end)
 
-    it("enters attack on an entropy signal without a rate spike", function()
+    it("ignores an entropy signal below min_rps", function()
         local b = new_b({ half_life = 100000, min_rps = 1000 })
         baseline.restore(b, {
             mean = 100, var = 0, mode = "normal", seeded = true,
             started_at = 0, updated_at = 0,
         }, 0)
-        assert(baseline.update(b, 10, 1, true) == "attack")
+        assert(baseline.update(b, 10, 1, true) == "normal")
+    end)
+
+    it("enters attack on entropy once the rate clears min_rps", function()
+        -- Attack line is max(mean, min_rps * 2) = 200. 150 is not a rate
+        -- spike, but it is enough traffic for the entropy signal to count.
+        local b = new_b({ half_life = 100000, min_rps = 100 })
+        baseline.restore(b, {
+            mean = 100, var = 0, mode = "normal", seeded = true,
+            started_at = 0, updated_at = 0,
+        }, 0)
+        assert(baseline.update(b, 150, 1, true) == "attack")
         assert(b.mean == 100)
+    end)
+
+    it("round-trips a baseline so a reload keeps the warmup clock", function()
+        local b = new_b({ warmup = 100, half_life = 1000 })
+        assert(baseline.update(b, 40, 10, false) == "normal")
+        for i = 1, 5 do
+            baseline.update(b, 40, 10 + i, false)
+        end
+        local text = baseline.export(b)
+        local b2 = new_b({ warmup = 100, half_life = 1000 })
+        local snap = baseline.import(text)
+        assert(snap)
+        baseline.restore(b2, snap, 20)
+        assert(b2.started_at == 10)
+        assert(b2.seeded == true)
+        assert(math.abs(b2.mean - b.mean) < 1e-6)
+        baseline.update(b2, 40, 20, false)
+        assert(b2.warming == true)
+        assert(b2.started_at == 10)
+        baseline.update(b2, 40, 120, false)
+        assert(b2.warming == false)
     end)
 
     it("caps how fast the mean can grow while still under the line", function()

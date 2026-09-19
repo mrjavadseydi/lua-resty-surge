@@ -10,7 +10,10 @@
 -- treats that as empty and does not activate it.
 
 local ffi = require "ffi"
+local bit = require "bit"
 local clientip = require "resty.surge.clientip"
+
+local band, bxor, rshift = bit.band, bit.bxor, bit.rshift
 
 ffi.cdef[[
 int mkdir(const char *pathname, unsigned int mode);
@@ -74,9 +77,18 @@ function _M.describe(feed)
 end
 
 function _M.ensure_dir(path)
-    local acc = ""
+    -- A relative feed_dir must stay relative. Prefixing every segment with
+    -- "/" would create /feeds at the filesystem root and every write would miss.
+    local abs = path:sub(1, 1) == "/"
+    local acc = abs and "" or nil
     for part in path:gmatch("[^/]+") do
-        acc = acc .. "/" .. part
+        if acc == nil then
+            acc = part
+        elseif acc == "" then
+            acc = "/" .. part
+        else
+            acc = acc .. "/" .. part
+        end
         ffi.C.mkdir(acc, 493)
     end
     return acc
@@ -179,6 +191,36 @@ function _M.list_path(dir, name)
     return dir .. "/" .. name .. ".list"
 end
 
+local crc_tab
+local function body_hash(body)
+    if ngx and ngx.crc32_long then
+        return ngx.crc32_long(body)
+    end
+    if not crc_tab then
+        crc_tab = {}
+        for i = 0, 255 do
+            local c = i
+            for _ = 1, 8 do
+                if band(c, 1) == 1 then
+                    c = bxor(rshift(c, 1), 0xEDB88320)
+                else
+                    c = rshift(c, 1)
+                end
+            end
+            crc_tab[i + 1] = c
+        end
+    end
+    local c = 0xffffffff
+    for i = 1, #body do
+        c = bxor(rshift(c, 8), crc_tab[band(bxor(c, body:byte(i)), 0xff) + 1])
+    end
+    c = bxor(c, 0xffffffff)
+    if c < 0 then
+        c = c + 4294967296
+    end
+    return c
+end
+
 function _M.read_list(path, format)
     local f = io.open(path, "rb")
     if not f then
@@ -187,11 +229,7 @@ function _M.read_list(path, format)
     local body = f:read("*a") or ""
     f:close()
     local parsed = _M.parse(body, format or "cidr")
-    local sum = #body
-    for i = 1, #body, 4096 do
-        sum = sum + body:byte(i)
-    end
-    return parsed.cidrs, sum
+    return parsed.cidrs, body_hash(body)
 end
 
 function _M.write_list(dir, name, cidrs)
@@ -265,6 +303,20 @@ function _M.fetch(url, opts, http_mod)
         return nil, "body too large", res
     end
     return body, nil, res
+end
+
+-- Call only after the list file is in place. Saving the ETag first turns a
+-- failed write into a permanent 304.
+function _M.remember_etag(bag, name, res, stored)
+    if not stored or type(res) ~= "table" or type(res.headers) ~= "table" then
+        return false
+    end
+    local tag = res.headers.etag or res.headers.ETag
+    if not tag or tag == "" then
+        return false
+    end
+    bag[name] = tag
+    return true
 end
 
 return _M

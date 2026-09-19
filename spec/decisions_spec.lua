@@ -67,5 +67,34 @@ describe("decision snapshot", function()
         assert(r.status == 403)
         assert(r.close == false)
         assert(r.incident == "srg-1")
+        assert(r.manual == false)
+        assert(r.until_ts == nil)
+    end)
+
+    it("keeps a manual block and its expiry across a snapshot", function()
+        local snap = {
+            mode = "normal",
+            list = {
+                {
+                    family = "v4",
+                    bits = 32,
+                    key = "\10\0\0\9",
+                    action = "block",
+                    reason = "manual",
+                    message = "operator",
+                    close = false,
+                    status = 403,
+                    ttl = 600,
+                    until_ts = 1700000000,
+                    manual = true,
+                    incident = "srg-manual",
+                },
+            },
+        }
+        local r = decisions.decode(decisions.encode(snap)).list[1]
+        assert(r.manual == true)
+        assert(r.until_ts == 1700000000)
+        assert(r.action == "block")
+        assert(r.incident == "srg-manual")
     end)
 end)

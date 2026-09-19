@@ -129,7 +129,15 @@ function _M.parse(opts)
         end
     end
 
-    local feeds = {}
+    -- Read only when the TCP peer is a trusted proxy. Default is the
+    -- header a CDN appends; CF-Connecting-IP and similar are one option.
+    local client_header = opts.client_header or "X-Forwarded-For"
+    if type(client_header) ~= "string" or not client_header:match("^[%w%-]+$") then
+        error("surge: client_header must be an HTTP header name")
+    end
+    local client_var = "http_" .. client_header:lower():gsub("-", "_")
+
+    local feeds, seen = {}, {}
     if opts.feeds ~= nil then
         if type(opts.feeds) ~= "table" then
             error("surge: feeds must be a list")
@@ -139,6 +147,11 @@ function _M.parse(opts)
             if not feed then
                 error(err)
             end
+            if seen[feed.name] then
+                error('surge: duplicate feed name "' .. feed.name
+                    .. '"; each feed needs a unique name')
+            end
+            seen[feed.name] = true
             feeds[#feeds + 1] = feed
         end
     end
@@ -162,6 +175,8 @@ function _M.parse(opts)
         allow6 = allow6,
         paths = paths,
         trusted = trusted,
+        client_header = client_header,
+        client_var = client_var,
         feeds = feeds,
         feed_dir = feed_dir,
         dict = dict,

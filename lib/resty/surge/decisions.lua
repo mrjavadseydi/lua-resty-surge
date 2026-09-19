@@ -174,6 +174,10 @@ function _M.encode(snap)
         parts[#parts + 1] = u16(r.status or 403)
         parts[#parts + 1] = u32(r.ttl or 0)
         parts[#parts + 1] = wstr(r.incident or "")
+        -- manual and until_ts have to cross workers and a leader restart.
+        -- A block that lives only in worker 0's memory is gone on the next tick.
+        parts[#parts + 1] = char(r.manual and 1 or 0)
+        parts[#parts + 1] = u32(math.floor(r.until_ts or 0))
     end
     return table.concat(parts)
 end
@@ -219,7 +223,10 @@ function _M.decode(blob)
         ttl, i = r32(blob, i)
         local incident
         incident, i = rstr(blob, i)
-        if not incident or not ttl then
+        local flags = byte(blob, i)
+        local until_ts
+        until_ts, i = r32(blob, i + 1)
+        if not incident or not ttl or not until_ts then
             return nil, "truncated tail"
         end
         list[k] = {
@@ -234,6 +241,8 @@ function _M.decode(blob)
             status = status,
             ttl = ttl,
             incident = incident,
+            manual = flags == 1,
+            until_ts = until_ts ~= 0 and until_ts or nil,
         }
     end
     return { mode = mode, list = list }

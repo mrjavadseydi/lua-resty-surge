@@ -40,4 +40,52 @@ describe("client address", function()
         local rule = ip.allow_rule("/health")
         assert(rule.path == "/health")
     end)
+
+    it("takes the rightmost untrusted hop and drops a spoofed prefix", function()
+        local trusted = { ip.parse_cidr("10.0.0.0/8") }
+        local fam, bin = ip.client_from_xff(
+            "9.9.9.9, 1.2.3.4, 10.1.2.3", trusted, 8)
+        assert(fam == "v4")
+        assert(bin == v4(1, 2, 3, 4))
+        fam, bin = ip.client_from_xff("1.2.3.4:443, 10.0.0.9", trusted)
+        assert(bin == v4(1, 2, 3, 4))
+        local v6 = ip.parse_cidr("2001:db8::5")
+        fam, bin = ip.client_from_xff("10.0.0.9, [2001:db8::5]:443", trusted)
+        assert(fam == "v6")
+        assert(bin == v6.bin)
+    end)
+
+    it("looks at only the last eight hops", function()
+        local trusted = { ip.parse_cidr("10.0.0.0/8") }
+        local parts = { "8.8.8.8" }
+        for i = 1, 8 do
+            parts[#parts + 1] = "10.0.0." .. i
+        end
+        local _, bin = ip.client_from_xff(table.concat(parts, ", "), trusted, 8)
+        assert(bin == v4(10, 0, 0, 1))
+    end)
+
+    it("ignores the header unless the peer is a trusted proxy", function()
+        local trusted = { ip.parse_cidr("10.0.0.0/8") }
+        local peer = v4(1, 2, 3, 4)
+        local _, bin = ip.client_addr(peer, {
+            trusted = trusted,
+            xff = "9.9.9.9",
+        })
+        assert(bin == peer)
+        local proxy = v4(10, 9, 8, 7)
+        _, bin = ip.client_addr(proxy, {
+            trusted = trusted,
+            xff = "9.9.9.9, 10.0.0.1",
+            realip_rewritten = true,
+        })
+        assert(bin == proxy)
+        _, bin = ip.client_addr(proxy, {
+            trusted = trusted,
+            xff = "8.8.8.8, 10.0.0.1",
+        })
+        assert(bin == v4(8, 8, 8, 8))
+        _, bin = ip.client_addr(proxy, { trusted = trusted })
+        assert(bin == proxy)
+    end)
 end)
