@@ -19,6 +19,10 @@ local baseline = require "resty.surge.baseline"
 local gcra = require "resty.surge.gcra"
 local feeds = require "resty.surge.feeds"
 local ipdb = require "resty.surge.ipdb"
+local fingerprint = require "resty.surge.fingerprint"
+local challenge = require "resty.surge.challenge"
+local ja4 = require "resty.surge.ja4"
+local sha = require "resty.surge.sha256"
 
 local _M = { _VERSION = "0.1.0" }
 
@@ -46,7 +50,8 @@ local err_n = 0
 local err_at = 0
 local err_last
 local seq = 0
-local early_logged = false
+local secret_cur, secret_prev
+local secret_ver, secret_prev_ver = 0, 0
 
 local function has_prefix(s, p)
     local n = #p
@@ -86,7 +91,22 @@ local function empty_box()
         sample = 16,
         ver = 0,
         count = 0,
+        fp = {},
+        fp_n = 0,
     }
+end
+
+local function index_fp(list)
+    local fp = {}
+    local n = 0
+    for i = 1, #list do
+        local r = list[i]
+        if r.family == "fp" then
+            fp[r.key] = r
+            n = n + 1
+        end
+    end
+    return fp, n
 end
 
 local function install(snap)
@@ -104,6 +124,7 @@ local function install(snap)
     box.mean = snap.mean
     box.sigma = snap.sigma
     box.entropy = snap.entropy
+    box.fp, box.fp_n = index_fp(snap.list)
 end
 
 local function gate_for(sk)
@@ -138,6 +159,7 @@ local function make_state(dict, id)
     local sk_sub4 = sketch.new(w, 4)
     local sk_sub6 = sketch.new(w, 4)
     local sk_uri = sketch.new(w, 4)
+    local sk_fp = sketch.new(w, 4)
     local k = p.topk
     state = {
         dict = dict,
@@ -154,12 +176,14 @@ local function make_state(dict, id)
             dim(prefix .. "s4", "s4", sk_sub4, topk.new(k)),
             dim(prefix .. "s6", "s6", sk_sub6, topk.new(k)),
             dim(prefix .. "u", "u", sk_uri, topk.new(k, gate_for(sk_uri))),
+            dim(prefix .. "f", "f", sk_fp, topk.new(k, gate_for(sk_fp))),
         },
     }
     -- Named handles for the request path. The dims array is what the timer walks.
     state.ip4, state.ip6 = state.dims[1], state.dims[2]
     state.sub4, state.sub6 = state.dims[3], state.dims[4]
     state.uri = state.dims[5]
+    state.fp = state.dims[6]
     state.analyze = on_merged
 end
 
@@ -201,7 +225,64 @@ local function publish(snap)
     return true
 end
 
+local function new_secret()
+    local ok, random = pcall(require, "resty.random")
+    if ok and random.bytes then
+        local raw = random.bytes(32, true)
+        if raw then
+            return sha.hex(raw)
+        end
+    end
+    return sha.hex(sha.sha256(tostring(ngx.now()) .. ":" .. tostring(ngx.worker.pid())))
+end
+
+local function load_secrets()
+    if not shared then
+        return
+    end
+    local ver = shared:get("pow:ver") or 0
+    if ver == secret_ver and secret_cur then
+        return
+    end
+    secret_cur = shared:get("pow:cur")
+    secret_prev = shared:get("pow:prev")
+    secret_ver = ver
+    secret_prev_ver = shared:get("pow:prev_ver") or 0
+end
+
+local function ensure_secret()
+    if shared:get("pow:cur") then
+        load_secrets()
+        return
+    end
+    if shared:add("pow:cur", new_secret()) then
+        shared:set("pow:at", ngx.now())
+        shared:set("pow:ver", 1)
+        shared:set("pow:prev_ver", 0)
+    end
+    load_secrets()
+end
+
+local function maybe_rotate_secret(now)
+    local at = shared:get("pow:at") or 0
+    local every = cfg.params.secret_rotate or 86400
+    if now - at < every then
+        return
+    end
+    local cur = shared:get("pow:cur")
+    local ver = shared:get("pow:ver") or 1
+    if cur then
+        shared:set("pow:prev", cur)
+        shared:set("pow:prev_ver", ver)
+    end
+    shared:set("pow:cur", new_secret())
+    shared:set("pow:at", now)
+    shared:incr("pow:ver", 1, 0)
+    load_secrets()
+end
+
 on_merged = function(merged)
+    maybe_rotate_secret(ngx.now())
     -- Another leader may have saved a newer clock while this worker waited
     -- on the lease. Continue from that snapshot instead of overwriting it.
     local saved = state.dict:get("baseline")
@@ -288,7 +369,7 @@ local function prefix_hit(sk, full, nbytes)
     return sketch.query(sk, full, nbytes) >= cfg.params.admit_share * total
 end
 
-local function observe(family, bin)
+local function observe(family, bin, fp_key)
     sample_n = sample_n + 1
     local mod = box.sample
     if mod > 1 and sample_n < mod then
@@ -327,10 +408,145 @@ local function observe(family, bin)
         sketch.add(ud.sketch, uri, 1)
         topk.add(ud.topk, uri, 1)
     end
+    if fp_key and state.fp then
+        local d = state.fp
+        sketch.add(d.sketch, fp_key, 1)
+        topk.add(d.topk, fp_key, 1)
+    end
+end
+
+local function due_sample()
+    local mod = box.sample or 1
+    if mod <= 1 then
+        return true
+    end
+    return sample_n + 1 >= mod
+end
+
+local function api_request()
+    local uri = ngx.var.uri or ""
+    local prefs = cfg.api or {}
+    for i = 1, #prefs do
+        if has_prefix(uri, prefs[i]) then
+            return true
+        end
+    end
+    local accept = ngx.var.http_accept
+    if accept and string.find(accept, "json", 1, true) then
+        local cookie = ngx.var.http_cookie
+        if not cookie or cookie == "" then
+            return true
+        end
+    end
+    return false
+end
+
+local cookie_checked, cookie_pass
+
+local function verified(bin)
+    if cookie_checked then
+        return cookie_pass
+    end
+    cookie_checked = true
+    cookie_pass = challenge.valid(ngx.var.http_cookie, bin, ngx.now(),
+        secret_cur, secret_prev, secret_ver, secret_prev_ver)
+    return cookie_pass
+end
+
+local function wants_cookie(dec)
+    if box.mode == "attack" then
+        return true
+    end
+    return dec and not dec.manual and dec.reason == "heavy_hitter"
+        and (dec.action == "block" or dec.action == "challenge" or dec.close)
+end
+
+local function limit_denied(dec)
+    local rate = (dec.rate or cfg.params.limit_rps) / (state.nworkers or 1)
+    if rate < 0.001 then
+        rate = 0.001
+    end
+    local interval, tau = gcra.params(rate, cfg.params.gcra_burst)
+    local allowed, tat = gcra.check(tats[dec.incident], ngx.now(), interval, tau)
+    if not allowed then
+        return dec, 429
+    end
+    tats[dec.incident] = tat
+    return nil
+end
+
+local function try_pow(bin)
+    local nonce = ngx.var.arg_srg_pow
+    local token = ngx.var.arg_srg_ch
+    if not nonce or nonce == "" or not token or token == "" then
+        return nil
+    end
+    local bits = cfg.params.pow_bits or 16
+    local ttl = cfg.params.pow_ttl or 1200
+    if not challenge.proof_ok(token, nonce, bits, ngx.now(), bin, ttl) then
+        return nil
+    end
+    if not secret_cur then
+        return nil
+    end
+    local value = challenge.issue(bin, ngx.now(), ttl, bits, secret_ver, secret_cur)
+    if not value then
+        return nil
+    end
+    return challenge.cookie_header(value, ttl, ngx.var.scheme == "https")
+end
+
+-- Returns a decision, "page", "redirect", or nil. No ngx.exit in here.
+local function apply_dec(dec, bin, pass)
+    if not dec then
+        return nil
+    end
+    if cfg.dry_run then
+        if dec.action == "block" or dec.close then
+            if cfg.on_block then
+                pcall(cfg.on_block, dec)
+            end
+        end
+        if dec.action and dec.action ~= "observe" then
+            log.limited("dry:" .. (dec.incident or ""), ngx.NOTICE,
+                "surge: dry-run would " .. dec.action .. " "
+                .. (dec.incident or "") .. " " .. (dec.reason or ""))
+        end
+        return nil
+    end
+    if pass and not dec.manual and dec.reason == "heavy_hitter" then
+        return nil
+    end
+    if dec.action == "block" or dec.close then
+        return dec
+    end
+    if dec.action == "challenge" then
+        if api_request() then
+            return dec, 403
+        end
+        local baked = try_pow(bin)
+        if baked then
+            return "redirect", baked
+        end
+        local bits = cfg.params.pow_bits or 16
+        local ttl = cfg.params.pow_ttl or 1200
+        local token = challenge.token(bin, ngx.now(), ttl, bits)
+        local html = token and challenge.page(token, bits)
+        if not html then
+            return nil
+        end
+        return "page", html
+    end
+    if dec.action == "limit" then
+        return limit_denied(dec)
+    end
+    return nil
 end
 
 -- Returns a decision to deny, or nil to continue. No ngx.exit in here.
 local function protect_inner()
+    cookie_checked = false
+    cookie_pass = false
     if cfg.test_hooks and ngx.var.arg_surge_fail == "1" then
         error("injected")
     end
@@ -368,35 +584,6 @@ local function protect_inner()
 
     local trie = family == "v6" and box.trie6 or box.trie4
     local dec = decisions.lookup(trie, bin, accept_dec)
-    local blocking = dec and (dec.action == "block" or dec.close)
-    if blocking and not cfg.dry_run then
-        -- Denied requests are not counted. They must stay cheaper than a
-        -- request we actually serve, and the decision already remembers them.
-        return dec
-    end
-    -- Challenge has no page yet, so it throttles the same way limit does.
-    if dec and not cfg.dry_run
-        and (dec.action == "limit" or dec.action == "challenge")
-    then
-        local rate = (dec.rate or cfg.params.limit_rps) / (state.nworkers or 1)
-        if rate < 0.001 then
-            rate = 0.001
-        end
-        local interval, tau = gcra.params(rate, cfg.params.gcra_burst)
-        local allowed, tat = gcra.check(tats[dec.incident], ngx.now(), interval, tau)
-        if not allowed then
-            return dec, 429
-        end
-        tats[dec.incident] = tat
-    end
-    if blocking then
-        log.limited("dry:" .. dec.incident, ngx.NOTICE,
-            "surge: dry-run would block " .. dec.incident
-            .. " " .. (dec.reason or ""))
-        if cfg.on_block then
-            pcall(cfg.on_block, dec)
-        end
-    end
 
     local rep = family == "v6" and box.rep6 or box.rep4
     local listed = ipdb.hit(rep, bin)
@@ -409,7 +596,52 @@ local function protect_inner()
             .. " " .. (listed.reason or ""))
     end
 
-    observe(family, bin)
+    -- Header reads stay off the normal path. Attack mode and an existing
+    -- fingerprint decision need the key on every request; elevated mode
+    -- otherwise fingerprints only the sampled requests.
+    local want_fp = false
+    if cfg.test_hooks and ngx.var.arg_surge_fp == "1" then
+        want_fp = true
+    elseif box.mode == "attack"
+        or (box.mode == "elevated" and ((box.fp_n or 0) > 0 or due_sample()))
+    then
+        want_fp = true
+    end
+    local fp_key
+    if want_fp then
+        fp_key = fingerprint.capture()
+    end
+    local fpdec
+    if fp_key and box.fp then
+        fpdec = box.fp[fp_key]
+        if fpdec and not accept_dec(fpdec) then
+            fpdec = nil
+        end
+    end
+
+    local pass = false
+    if wants_cookie(dec) or wants_cookie(fpdec) then
+        pass = verified(bin)
+    end
+    -- A heavy-hitter block is enforced here, not in early(), so this cookie
+    -- can still let a solved browser through.
+    local out, extra = apply_dec(dec, bin, pass)
+    if out then
+        return out, extra
+    end
+    out, extra = apply_dec(fpdec, bin, pass)
+    if out then
+        return out, extra
+    end
+
+    if cfg.test_hooks and ngx.var.arg_surge_fp == "1" and fp_key then
+        ngx.header["X-Surge-Fp"] = fp_key
+        if ngx.ctx and type(ngx.ctx.ja4) == "string" then
+            ngx.header["X-Surge-Ja4"] = ngx.ctx.ja4
+        end
+    end
+
+    observe(family, bin, fp_key)
     return nil
 end
 
@@ -548,6 +780,7 @@ local function on_tick(premature)
         return
     end
     maybe_reload_feeds()
+    load_secrets()
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
@@ -577,6 +810,7 @@ function _M.start(opts)
     end
 
     cfg = config.parse(opts)
+    cfg.params.api_prefixes = cfg.api
     if config.needs_agent(cfg.feeds) and not agent_on then
         error("surge: url feeds need the privileged agent. Add this in the http {} block:\n"
             .. "    init_by_lua_block { require(\"resty.surge\").init() }")
@@ -630,11 +864,17 @@ function _M.start(opts)
     end
     started = true
 
+    ensure_secret()
     if id == 0 and #cfg.trusted == 0 then
         ngx.log(ngx.NOTICE,
             "surge: no trusted_proxies set; the TCP peer is treated as the client. "
             .. "Behind a CDN or load balancer, set trusted_proxies or use nginx real_ip, "
             .. "or a block can take the proxy down with the attacker.")
+    end
+    if id == 0 and #cfg.trusted > 0 then
+        ngx.log(ngx.NOTICE,
+            "surge: trusted_proxies is set; early() will not close the handshake, "
+            .. "because the TCP peer is the proxy.")
     end
 
     local ok, err = ngx.timer.at(0, on_tick)
@@ -656,6 +896,17 @@ function _M.protect()
         note_error(dec)
         return
     end
+    if dec == "page" then
+        ngx.status = 403
+        ngx.header["Content-Type"] = "text/html; charset=utf-8"
+        ngx.header["Cache-Control"] = "no-store"
+        ngx.print(status or "")
+        return ngx.exit(403)
+    end
+    if dec == "redirect" then
+        ngx.header["Set-Cookie"] = status
+        return ngx.redirect(ngx.var.uri, 302)
+    end
     if dec then
         if status then
             dec = {
@@ -671,13 +922,61 @@ function _M.protect()
     end
 end
 
+local function early_hit(bin, family)
+    local trie = family == "v6" and box.trie6 or box.trie4
+    local dec = decisions.lookup(trie, bin, function(d)
+        if d.uri or d.reason == "heavy_hitter" then
+            return false
+        end
+        return d.action == "block" or d.close
+    end)
+    if dec then
+        return dec
+    end
+    local rep = family == "v6" and box.rep6 or box.rep4
+    return ipdb.hit(rep, bin)
+end
+
 function _M.early()
-    if early_logged then
+    if not started or not state or not box then
         return
     end
-    early_logged = true
-    ngx.log(ngx.NOTICE, "surge: early() does not reject yet; "
-        .. "pre-handshake blocking is not enabled")
+    -- The TCP peer is the proxy. Closing it would blackhole the CDN.
+    if cfg.trusted[1] then
+        return
+    end
+    if ja4.available() then
+        local ok, val = pcall(ja4.capture)
+        if ok and type(val) == "string" then
+            ngx.ctx.ja4 = val
+        end
+    end
+    local dec
+    local ok, err = xpcall(function()
+        local ssl = require "ngx.ssl"
+        local addr, typ = ssl.raw_client_addr()
+        if typ ~= "inet" and typ ~= "inet6" then
+            return
+        end
+        local family, bin = clientip.identity(addr)
+        if not family then
+            return
+        end
+        dec = early_hit(bin, family)
+    end, debug.traceback)
+    if not ok then
+        note_error(err)
+        return
+    end
+    if not dec then
+        return
+    end
+    if cfg.dry_run then
+        log.limited("dry-early:" .. (dec.incident or ""), ngx.NOTICE,
+            "surge: dry-run would close the handshake for " .. (dec.incident or ""))
+        return
+    end
+    return ngx.exit(ngx.ERROR)
 end
 
 function _M.status()
@@ -793,7 +1092,7 @@ function _M._publish(items, mode)
             status = it.status or 403,
             ttl = ttl,
             until_ts = now + ttl,
-            manual = true,
+            manual = it.manual ~= false,
             incident = it.incident or string.format("srg-%x-%x", state.id or 0, seq),
         }
     end

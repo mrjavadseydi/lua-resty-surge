@@ -39,9 +39,9 @@ Zero config is three lines and does not enable the privileged agent, feeds, or `
 
 **HTTP fingerprint.** HTTP/1 uses `raw_header(true)` for the fixed header-name order, capped. HTTP/2 and HTTP/3 do not. Calling `raw_header` there aborts the request. Order is omitted and the fingerprint version byte changes. User-Agent is hashed, not stored. Cookie presence is one bit. The readable form is built only when a decision is created.
 
-**JA4.** Ship it only if both are true: the ClientHello getters exist, and an integration test shows `ngx.ctx` written in `ssl_client_hello_by_lua` is readable in `access_by_lua`. Otherwise the TLS half is off and the docs say why. No private FFI into `ngx_connection_t`.
+**JA4.** The ClientHello getters exist on 1.31.1.1, and `t/phase6.sh` shows `ngx.ctx` written in `ssl_client_hello_by_lua` is readable on the request. `early()` stores a JA4 string there for direct clients. The protocol character is `t` because this hook is TCP. If the supported-versions extension is absent the version field is `00`. No private FFI into `ngx_connection_t`. Behind `trusted_proxies`, `early()` returns before computing JA4: the handshake belongs to the proxy.
 
-**`early()`.** `ngx.ssl.raw_client_addr()` plus the worker-local block table and radix. If `trusted_proxies` is set, `early()` returns immediately and `start()` logs once that the TCP peer is the proxy, so a pre-handshake block would blackhole the CDN.
+**`early()`.** `ngx.ssl.raw_client_addr()` plus the worker-local block table and radix. If `trusted_proxies` is set, `early()` returns immediately and `start()` logs once that the TCP peer is the proxy, so a pre-handshake block would blackhole the CDN. Heavy-hitter blocks are not closed here. The challenge cookie is only visible on the HTTP request, so those blocks are enforced in `protect()`. Manual blocks and reputation hits still abort the handshake.
 
 **Real client IP.** Prefer nginx `real_ip` so the hot path stays a single `binary_remote_addr` read. Use `trusted_proxies` only when `real_ip` is not in play. If both are configured and `$realip_remote_addr` is set, the connecting address was already rewritten and XFF is not parsed. XFF parsing is bounded and runs only when the peer sits in `trusted_proxies`. With neither configured, `start()` logs one notice.
 

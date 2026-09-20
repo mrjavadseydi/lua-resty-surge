@@ -47,8 +47,14 @@ M.relaxed = preset({
     limit_rps = 200,
     -- At or above this confidence a stage change takes one tick.
     confidence_skip = 0.95,
-    -- False until the challenge page exists: limit steps straight to block.
-    challenge_ready = false,
+    -- The challenge page exists. API paths still skip it and block.
+    challenge_ready = true,
+    -- Leading zero bits the browser must find. Higher is slower for bots.
+    pow_bits = 12,
+    -- How long a solved challenge cookie stays valid, in seconds.
+    pow_ttl = 1800,
+    -- Workers accept the previous HMAC secret for this long after rotation.
+    secret_rotate = 86400,
     sketch_width = 2048,
     sketch_depth = 4,
     -- Extra requests the limit stage may pass at once, per worker.
@@ -81,7 +87,10 @@ M.balanced = preset({
     min_key_rps = 20,
     limit_rps = 80,
     confidence_skip = 0.9,
-    challenge_ready = false,
+    challenge_ready = true,
+    pow_bits = 16,
+    pow_ttl = 1200,
+    secret_rotate = 86400,
     sketch_width = 2048,
     sketch_depth = 4,
     gcra_burst = 10,
@@ -113,7 +122,10 @@ M.strict = preset({
     min_key_rps = 10,
     limit_rps = 40,
     confidence_skip = 0.8,
-    challenge_ready = false,
+    challenge_ready = true,
+    pow_bits = 18,
+    pow_ttl = 600,
+    secret_rotate = 86400,
     sketch_width = 2048,
     sketch_depth = 4,
     gcra_burst = 10,

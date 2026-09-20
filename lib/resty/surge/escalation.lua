@@ -21,7 +21,7 @@ function _M.new(incident)
     }
 end
 
-function _M.step(st, offending, confidence, opts, now, cap)
+function _M.step(st, offending, confidence, opts, now, cap, api_only)
     if cap == "observe" then
         st.stage = "observe"
         st.confidence = confidence or 0
@@ -67,9 +67,8 @@ function _M.step(st, offending, confidence, opts, now, cap)
         st.stage = "limit"
         st.ttl = base
     elseif st.stage == "limit" then
-        -- api_only skips the page: a JSON client cannot solve it.
-        -- challenge_ready false (the default until the page exists) does too.
-        if opts.api_only or opts.challenge_ready == false then
+        -- API paths cannot run the page. challenge_ready false skips it too.
+        if api_only or opts.api_only or opts.challenge_ready == false then
             enter_block()
         else
             st.stage = "challenge"

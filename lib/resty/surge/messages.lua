@@ -20,7 +20,7 @@ function _M.label(key, bits)
         end
         return s
     end
-    if bits and n > 4 then
+    if bits and bits > 0 and n > 4 then
         local hex = {}
         for i = 1, n do
             hex[i] = string.format("%02x", byte(key, i))

@@ -160,6 +160,20 @@ function _M.parse(opts)
     if type(dict) ~= "string" or dict == "" then
         error("surge: dict must be the lua_shared_dict name")
     end
+    local api = {}
+    if opts.api ~= nil then
+        if type(opts.api) ~= "table" then
+            error("surge: api must be a list of path prefixes")
+        end
+        for i = 1, #opts.api do
+            local spec = opts.api[i]
+            if type(spec) ~= "string" or spec:sub(1, 1) ~= "/" then
+                error("surge: api[" .. i .. "] must be a path prefix")
+            end
+            api[#api + 1] = spec
+        end
+    end
+
     local feed_dir = opts.feed_dir or "/tmp/surge-feeds"
     if type(feed_dir) ~= "string" or feed_dir == "" then
         error("surge: feed_dir must be a directory path")
@@ -177,6 +191,7 @@ function _M.parse(opts)
         trusted = trusted,
         client_header = client_header,
         client_var = client_var,
+        api = api,
         feeds = feeds,
         feed_dir = feed_dir,
         dict = dict,

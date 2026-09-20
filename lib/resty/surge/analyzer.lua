@@ -12,6 +12,7 @@ local exp = math.exp
 local baseline = require "resty.surge.baseline"
 local entropy = require "resty.surge.entropy"
 local escalation = require "resty.surge.escalation"
+local fingerprint = require "resty.surge.fingerprint"
 local messages = require "resty.surge.messages"
 
 local _M = {}
@@ -20,6 +21,7 @@ local BLOCK_DIMS = {
     i4 = { family = "v4", bits = 32 },
     s4 = { family = "v4", bits = 24 },
     s6 = { family = "v6", bits = 64 },
+    f = { family = "fp" },
 }
 
 local function tracker(params)
@@ -43,6 +45,7 @@ function _M.new(params)
             s4 = tracker(params),
             s6 = tracker(params),
             u = tracker(params),
+            f = tracker(params),
         },
         shares = {},
         share_at = {},
@@ -110,7 +113,7 @@ function _M.run(ctx, merged, now, previous)
     local frozen_before = ctx.baseline.mode ~= "normal"
     local entropy_info = {}
     local entropy_bad = false
-    for _, dim in ipairs({ "s4", "s6", "u" }) do
+    for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
         local h = entropy.normalized(histogram(merged[dim], totals[dim]))
         local base = ctx.entropy[dim]:mean()
         local delta = 0
@@ -126,7 +129,7 @@ function _M.run(ctx, merged, now, previous)
     local mode = baseline.update(ctx.baseline, rps, now, entropy_bad)
     local warming = ctx.baseline.warming
     local frozen = mode ~= "normal"
-    for _, dim in ipairs({ "s4", "s6", "u" }) do
+    for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
         ctx.entropy[dim]:update(entropy_info[dim].h, frozen or warming)
     end
 
@@ -143,11 +146,26 @@ function _M.run(ctx, merged, now, previous)
         end
     end
 
+    local api_only = false
+    local prefs = p.api_prefixes
+    if uri_scope and prefs then
+        for i = 1, #prefs do
+            local pre = prefs[i]
+            if string.sub(uri_scope, 1, #pre) == pre then
+                api_only = true
+                break
+            end
+        end
+    end
+
     local emitted = {}
     local manual_ids = {}
     local from_prev = {}
 
     local function dim_of(rec)
+        if rec.family == "fp" then
+            return "f"
+        end
         if rec.bits == 24 then
             return "s4"
         end
@@ -209,7 +227,9 @@ function _M.run(ctx, merged, now, previous)
             bits = meta.bits,
             action = action,
             reason = reason,
-            message = messages.line(action, messages.label(key, meta.bits),
+            message = messages.line(action,
+                meta.family == "fp" and fingerprint.short(key)
+                    or messages.label(key, meta.bits),
                 share, base or 0, rate, p.tick),
             uri = uri_scope,
             close = false,
@@ -309,7 +329,7 @@ function _M.run(ctx, merged, now, previous)
                     end
                     local conf = confidence_of(share, floor, st.streak)
                     local cap = ctx.dry_run and "observe" or nil
-                    escalation.step(st, true, conf, p, now, cap)
+                    escalation.step(st, true, conf, p, now, cap, api_only)
                     emit(id, st, key, meta, share, base, rate, "heavy_hitter")
                 elseif st then
                     escalation.step(st, false, 0, p, now, nil)
@@ -325,6 +345,7 @@ function _M.run(ctx, merged, now, previous)
     consider("i4", BLOCK_DIMS.i4, warming)
     consider("s4", BLOCK_DIMS.s4, warming)
     consider("s6", BLOCK_DIMS.s6, warming)
+    consider("f", BLOCK_DIMS.f, warming)
 
     -- Keys we blocked are absent from the top-K. Step them anyway so the
     -- TTL can expire them back to observe, and keep publishing until then.

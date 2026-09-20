@@ -94,6 +94,20 @@ describe("decision snapshot", function()
         local r = decisions.decode(decisions.encode(snap)).list[1]
         assert(r.manual == true)
         assert(r.until_ts == 1700000000)
+        local fp = decisions.decode(decisions.encode({
+            mode = "attack",
+            list = {
+                {
+                    family = "fp", bits = 0, key = "2GET20au",
+                    action = "challenge", reason = "heavy_hitter",
+                    message = "fp", close = false, status = 403,
+                    ttl = 30, incident = "srg-fp",
+                },
+            },
+        })).list[1]
+        assert(fp.family == "fp")
+        assert(fp.key == "2GET20au")
+        assert(fp.action == "challenge")
         assert(r.action == "block")
         assert(r.incident == "srg-manual")
     end)

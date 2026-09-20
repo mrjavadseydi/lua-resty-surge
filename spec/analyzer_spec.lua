@@ -261,4 +261,49 @@ describe("analyzer", function()
         end
         assert(kept, "an unexpired block was discarded")
     end)
+
+    it("can block a fingerprint and skip challenge on an api path", function()
+        local p = params()
+        p.api_prefixes = { "/api/" }
+        local ctx = analyzer.new(p)
+        local fp = "2GET20au00000000en1"
+        local function window(heavy)
+            local n = heavy and 900 or 1
+            local other = heavy and 10 or 99
+            return {
+                i4 = { [nat] = { key = nat, count = 20, error = 0 } },
+                i6 = {}, s4 = {}, s6 = {},
+                f = {
+                    [fp] = { key = fp, count = n, error = 0 },
+                    ["2GET20x"] = { key = "2GET20x", count = other, error = 0 },
+                },
+                u = { ["/api/login"] = { key = "/api/login", count = n, error = 0 } },
+                _totals = {
+                    i4 = 100, i6 = 0, s4 = 0, s6 = 0,
+                    f = n + other, u = n,
+                },
+            }
+        end
+        local now = 0
+        for _ = 1, 6 do
+            now = now + 0.25
+            analyzer.run(ctx, window(false), now, nil)
+        end
+        local saw_block = false
+        for _ = 1, 8 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, window(true), now, nil)
+            for i = 1, #snap.list do
+                local rec = snap.list[i]
+                assert(rec.key ~= "/api/login")
+                if rec.key == fp and rec.family == "fp" then
+                    assert(rec.action ~= "challenge")
+                    if rec.action == "block" then
+                        saw_block = true
+                    end
+                end
+            end
+        end
+        assert(saw_block, "fingerprint was not blocked")
+    end)
 end)
