@@ -154,6 +154,8 @@ local PAGE = [[<!doctype html><meta charset=utf-8><title>Checking your browser</
 (function(){
 var ch=%q;
 var bits=%d;
+var ret=%q;
+var method=%q;
 var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
 function rr(n,x){return (x>>>n)|(x<<(32-n));}
 function add(a,b){return (a+b)>>>0;}
@@ -205,7 +207,17 @@ function step(){
   while(n--){
     var nonce=String(i++);
     if(zeros(sha256(ch+nonce))>=bits){
-      location.replace(location.pathname+"?srg_pow="+nonce+"&srg_ch="+encodeURIComponent(ch));
+      var join=ret.indexOf("?")>=0?"&":"?";
+      var proof=ret+join+"srg_pow="+nonce+"&srg_ch="+encodeURIComponent(ch);
+      var done=function(){
+        if(method==="POST"||method==="PUT"||method==="PATCH") location.reload();
+        else location.replace(ret);
+      };
+      if(window.fetch){
+        fetch(proof,{credentials:"same-origin",redirect:"manual"}).then(done,done);
+      }else{
+        location.replace(proof);
+      }
       return;
     }
   }
@@ -216,11 +228,31 @@ step();
 </script>
 ]]
 
-function _M.page(token, bits)
+-- request_uri keeps the raw path and query. A value that is not a
+-- same-origin path is replaced so the page cannot be an open redirect.
+function _M.safe_target(uri)
+    if type(uri) ~= "string" or uri:sub(1, 1) ~= "/" or uri:sub(1, 2) == "//" then
+        return "/"
+    end
+    if uri:find("[\r\n\\]") or uri:find("://", 1, true) then
+        return "/"
+    end
+    return uri
+end
+
+function _M.page(token, bits, target, method)
     if type(token) ~= "string" or token:find("[^%w%.]") then
         return nil
     end
-    return string.format(PAGE, token, bits)
+    target = _M.safe_target(target)
+    if type(method) ~= "string" then
+        method = "GET"
+    end
+    method = method:upper():gsub("[^A-Z]", "")
+    if method == "" then
+        method = "GET"
+    end
+    return string.format(PAGE, token, bits, target, method)
 end
 
 return _M

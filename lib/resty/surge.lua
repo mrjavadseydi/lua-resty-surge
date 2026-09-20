@@ -458,7 +458,8 @@ local function wants_cookie(dec)
         return true
     end
     return dec and not dec.manual and dec.reason == "heavy_hitter"
-        and (dec.action == "block" or dec.action == "challenge" or dec.close)
+        and (dec.action == "block" or dec.action == "challenge"
+            or dec.action == "limit" or dec.close)
 end
 
 local function limit_denied(dec)
@@ -496,6 +497,12 @@ local function try_pow(bin)
     return challenge.cookie_header(value, ttl, ngx.var.scheme == "https")
 end
 
+local function return_target()
+    -- request_uri is the raw path and query, percent-encoding included.
+    local uri = ngx.var.request_uri
+    return challenge.safe_target(uri)
+end
+
 -- Returns a decision, "page", "redirect", or nil. No ngx.exit in here.
 local function apply_dec(dec, bin, pass)
     if not dec then
@@ -526,12 +533,14 @@ local function apply_dec(dec, bin, pass)
         end
         local baked = try_pow(bin)
         if baked then
-            return "redirect", baked
+            -- 204 keeps the document in place so a POST can be resubmitted.
+            return "solved", baked
         end
         local bits = cfg.params.pow_bits or 16
         local ttl = cfg.params.pow_ttl or 1200
         local token = challenge.token(bin, ngx.now(), ttl, bits)
-        local html = token and challenge.page(token, bits)
+        local html = token and challenge.page(token, bits, return_target(),
+            ngx.req.get_method())
         if not html then
             return nil
         end
@@ -903,9 +912,12 @@ function _M.protect()
         ngx.print(status or "")
         return ngx.exit(403)
     end
-    if dec == "redirect" then
+    if dec == "solved" then
+        ngx.status = 204
         ngx.header["Set-Cookie"] = status
-        return ngx.redirect(ngx.var.uri, 302)
+        ngx.header["Cache-Control"] = "no-store"
+        ngx.header["Content-Length"] = 0
+        return ngx.exit(204)
     end
     if dec then
         if status then
@@ -923,6 +935,15 @@ function _M.protect()
 end
 
 local function early_hit(bin, family)
+    -- Same allow rules as protect(), minus paths: ClientHello has no URI,
+    -- so a path allow is applied on the HTTP request instead.
+    if allowed_ip(family, bin) then
+        return nil
+    end
+    local good = family == "v6" and box.good6 or box.good4
+    if ipdb.hit(good, bin) then
+        return nil
+    end
     local trie = family == "v6" and box.trie6 or box.trie4
     local dec = decisions.lookup(trie, bin, function(d)
         if d.uri or d.reason == "heavy_hitter" then

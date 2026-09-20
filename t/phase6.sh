@@ -6,6 +6,7 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 OR=${OR:-openresty}
 PREFIX=${PREFIX:-/tmp/surge-phase6}
 TRUST=${TRUST:-/tmp/surge-phase6-trust}
+ALLOW=${ALLOW:-/tmp/surge-phase6-allow}
 HTTP=${HTTP:-18450}
 SSL=${SSL:-18451}
 H2=${H2:-18452}
@@ -50,6 +51,7 @@ write_conf() {
     http=$3
     ssl=$4
     h2=$5
+    allow_extra=${6:-}
     mkdir -p "$prefix/logs" "$prefix/conf"
     if [ ! -f "$prefix/conf/cert.pem" ]; then
         openssl req -x509 -newkey rsa:2048 -keyout "$prefix/conf/key.pem" \
@@ -67,7 +69,7 @@ http {
     lua_shared_dict surge 64m;
     init_worker_by_lua_block {
         require("resty.surge").start({
-            allow = { "/health" },
+            allow = { "/health"$allow_extra },
             api = { "/api/" },
             trusted_proxies = $trusted,
             advanced = { test_hooks = true, tick = 0.25, pow_bits = 8, pow_ttl = 120 },
@@ -124,10 +126,10 @@ http {
 EOF
 }
 
-rm -rf "$PREFIX" "$TRUST"
+rm -rf "$PREFIX" "$TRUST" "$ALLOW"
 write_conf "$PREFIX" "{}" "$HTTP" "$SSL" "$H2"
 "$OR" -p "$PREFIX" >/tmp/surge-phase6.out 2>&1 &
-trap 'stop "$PREFIX"; stop "$TRUST"' EXIT
+trap 'stop "$PREFIX"; stop "$TRUST"; stop "$ALLOW"' EXIT
 wait_port "$HTTP" || fail "startup" "$PREFIX"
 
 curl -sf "http://127.0.0.1:$HTTP/" | grep -q ok || fail "allow" "$PREFIX"
@@ -189,7 +191,7 @@ fi
 
 hdr=$(curl -sS -D - -o /dev/null \
     "http://127.0.0.1:$HTTP/?srg_pow=${nonce}&srg_ch=${token}")
-echo "$hdr" | grep -q " 302" || fail "pow was not accepted: $hdr" "$PREFIX"
+echo "$hdr" | grep -q " 204" || fail "pow was not accepted: $hdr" "$PREFIX"
 cookie=$(printf '%s\n' "$hdr" | awk 'tolower($1)=="set-cookie:" { print $2 }' \
     | tr -d '\r' | cut -d';' -f1)
 echo "$cookie" | grep -q '^srg_pow=' || fail "cookie missing: $hdr" "$PREFIX"
@@ -220,6 +222,21 @@ kept=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
     "https://127.0.0.1:$((SSL + 10))/" || true)
 if [ "$kept" != "403" ]; then
     fail "early() closed a trusted proxy ($kept)" "$TRUST"
+fi
+stop "$TRUST"
+
+# An allowlisted address is also on the manual block list. The handshake
+# must complete; protect() then allows the address.
+write_conf "$ALLOW" "{}" 18470 18471 18472 ', "127.0.0.1/32"'
+"$OR" -p "$ALLOW" >/tmp/surge-phase6-allow.out 2>&1 &
+wait_port 18470 || fail "allow startup" "$ALLOW"
+curl -sf "http://127.0.0.1:18470/_block" | grep -q published \
+    || fail "allow publish" "$ALLOW"
+sleep 0.8
+opened=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 \
+    "https://127.0.0.1:18471/" || true)
+if [ "$opened" != "200" ]; then
+    fail "early() closed an allowlisted address ($opened)" "$ALLOW"
 fi
 
 echo "phase6 ok"

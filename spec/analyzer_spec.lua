@@ -1,4 +1,5 @@
 local analyzer = require "resty.surge.analyzer"
+local baseline = require "resty.surge.baseline"
 
 local function params()
     return {
@@ -305,5 +306,121 @@ describe("analyzer", function()
             end
         end
         assert(saw_block, "fingerprint was not blocked")
+    end)
+
+    it("learns fingerprint entropy from elevated traffic and can leave attack", function()
+        local p = params()
+        p.min_rps = 0
+        p.cooldown = 1
+        p.entropy_drop = 0.2
+        p.entropy_rise = 0.2
+        local ctx = analyzer.new(p)
+        -- sigma = 100, so 400 rps is normal, 800 is elevated, 900 is attack.
+        baseline.restore(ctx.baseline, {
+            mean = 400, var = 10000, mode = "normal", seeded = true,
+            started_at = 0, updated_at = 0,
+        }, 0)
+        local chrome = "1GET11chrome"
+        local function rates(ip_n, fps)
+            local f, ftotal = {}, 0
+            for k, n in pairs(fps) do
+                f[k] = { key = k, count = n, error = 0 }
+                ftotal = ftotal + n
+            end
+            return {
+                i4 = { [nat] = { key = nat, count = ip_n, error = 0 } },
+                i6 = {}, s4 = {}, s6 = {},
+                f = f,
+                u = { ["/"] = { key = "/", count = ip_n, error = 0 } },
+                _totals = {
+                    i4 = ip_n, i6 = 0, s4 = 0, s6 = 0, f = ftotal, u = ip_n,
+                },
+            }
+        end
+        local function mixed()
+            return rates(200, {
+                [chrome] = 40, otherb = 40, otherc = 40, otherd = 40, othere = 40,
+            })
+        end
+        local now = 10
+        for _ = 1, 4 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, rates(100, {}), now, nil)
+            assert(snap.mode == "normal", snap.mode)
+        end
+        assert(ctx.entropy.f:mean() == nil)
+
+        for _ = 1, 6 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, mixed(), now, nil)
+            assert(snap.mode ~= "attack", snap.mode)
+            assert(find(snap.list, chrome, "limit") == nil)
+            assert(find(snap.list, chrome, "block") == nil)
+            assert(find(snap.list, chrome, "challenge") == nil)
+        end
+        assert(ctx.entropy.f:mean() > 0.5, tostring(ctx.entropy.f:mean()))
+
+        local entered = false
+        for _ = 1, 6 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, rates(200, {
+                [chrome] = 20, botkit = 180,
+            }), now, nil)
+            if snap.mode == "attack" then
+                entered = true
+            end
+        end
+        assert(entered, "fingerprint collapse did not enter attack")
+        assert(ctx.entropy.f:mean() > 0.5)
+
+        local left = false
+        for _ = 1, 8 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, mixed(), now, nil)
+            if snap.mode ~= "attack" then
+                left = true
+                break
+            end
+        end
+        assert(left, "stuck in attack above min_rps")
+    end)
+
+    it("remembers a minority fingerprint first seen during attack", function()
+        local p = params()
+        p.min_rps = 0
+        local ctx = analyzer.new(p)
+        baseline.restore(ctx.baseline, {
+            mean = 400, var = 10000, mode = "attack", seeded = true,
+            started_at = 0, updated_at = 0,
+        }, 0)
+        local chrome = "1GET11chrome"
+        local bot = "1GET11botkit"
+        local function window()
+            return {
+                i4 = { [nat] = { key = nat, count = 10000, error = 0 } },
+                i6 = {}, s4 = {}, s6 = {},
+                f = {
+                    [chrome] = { key = chrome, count = 20, error = 0 },
+                    [bot] = { key = bot, count = 80, error = 0 },
+                },
+                u = { ["/"] = { key = "/", count = 10000, error = 0 } },
+                _totals = { i4 = 10000, i6 = 0, s4 = 0, s6 = 0, f = 100, u = 10000 },
+            }
+        end
+        local now = 100
+        local bot_hit = false
+        for _ = 1, 4 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, window(), now, nil)
+            assert(snap.mode == "attack", snap.mode)
+            assert(find(snap.list, chrome, "limit") == nil)
+            assert(find(snap.list, chrome, "challenge") == nil)
+            assert(find(snap.list, chrome, "block") == nil)
+            local rec = find(snap.list, bot)
+            if rec and rec.action ~= "observe" then
+                bot_hit = true
+            end
+        end
+        assert(bot_hit, "majority fingerprint was not escalated")
     end)
 end)

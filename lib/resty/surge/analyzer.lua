@@ -114,23 +114,45 @@ function _M.run(ctx, merged, now, previous)
     local entropy_info = {}
     local entropy_bad = false
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
-        local h = entropy.normalized(histogram(merged[dim], totals[dim]))
-        local base = ctx.entropy[dim]:mean()
-        local delta = 0
-        if base then
-            delta = h - base
-            if delta <= -p.entropy_drop or delta >= p.entropy_rise then
-                entropy_bad = true
+        -- Fingerprints are not sampled in normal mode. An empty window is
+        -- "no data", not entropy 0. Learning 0 makes the next real mix look
+        -- like an attack, and attack then freezes that 0 forever.
+        if dim == "f" and (totals[dim] or 0) <= 0 then
+            entropy_info[dim] = {
+                h = nil, base = ctx.entropy[dim]:mean(), delta = 0,
+            }
+        else
+            local h = entropy.normalized(histogram(merged[dim], totals[dim]))
+            local base = ctx.entropy[dim]:mean()
+            local delta = 0
+            if base then
+                delta = h - base
+                local drop = delta <= -p.entropy_drop
+                -- A rise in fingerprint entropy is more kinds of clients.
+                -- Only a drop (one toolkit) is an attack signal.
+                local rise = dim ~= "f" and delta >= p.entropy_rise
+                if drop or rise then
+                    entropy_bad = true
+                end
             end
+            entropy_info[dim] = { h = h, base = base or h, delta = delta }
         end
-        entropy_info[dim] = { h = h, base = base or h, delta = delta }
     end
 
     local mode = baseline.update(ctx.baseline, rps, now, entropy_bad)
     local warming = ctx.baseline.warming
     local frozen = mode ~= "normal"
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
-        ctx.entropy[dim]:update(entropy_info[dim].h, frozen or warming)
+        local h = entropy_info[dim].h
+        if h ~= nil then
+            local freeze = frozen or warming
+            -- Elevated is when fingerprints are first visible. That mix is
+            -- the reference. Freeze it only once the mode is attack.
+            if dim == "f" and mode == "elevated" then
+                freeze = false
+            end
+            ctx.entropy[dim]:update(h, freeze)
+        end
     end
 
     local alpha = 1 - exp(-p.tick / p.half_life)
@@ -280,9 +302,26 @@ function _M.run(ctx, merged, now, previous)
             end
 
             -- Judge against the baseline from before this tick. Seeding a
-            -- brand-new key during normal traffic is not an offense.
+            -- brand-new key is not an offense. Fingerprints are only sampled
+            -- once the mode has left normal, so elevated traffic is their
+            -- baseline. Attack must not teach a bot's share as normal.
             local seeded_now = false
-            if not hard_only and not frozen and not warming then
+            local learn = not hard_only and not warming
+            if dim == "f" then
+                if mode == "attack" then
+                    learn = false
+                    -- First sight during the attack. Under half the window
+                    -- is a browser, not one toolkit: remember the share and
+                    -- do not punish it. A majority fingerprint is still judged.
+                    if base == nil and share <= 0.5 then
+                        ctx.shares[id] = share
+                        seeded_now = true
+                    end
+                end
+            elseif frozen then
+                learn = false
+            end
+            if learn then
                 if base == nil then
                     ctx.shares[id] = share
                     seeded_now = true

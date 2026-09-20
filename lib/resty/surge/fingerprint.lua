@@ -78,6 +78,29 @@ local function first_lang(s)
     return s
 end
 
+-- The challenge cookie must not change the key. A solved browser would
+-- otherwise become a new fingerprint and miss the decision it just passed.
+function _M.foreign_cookie(value)
+    if type(value) == "table" then
+        for i = 1, #value do
+            if _M.foreign_cookie(value[i]) then
+                return true
+            end
+        end
+        return false
+    end
+    if type(value) ~= "string" or value == "" then
+        return false
+    end
+    for part in value:gmatch("[^;]+") do
+        local name = part:match("^%s*([^=;%s]+)")
+        if name and name ~= "srg_pow" then
+            return true
+        end
+    end
+    return false
+end
+
 function _M.presence(headers)
     local codes = {}
     for name, code in pairs(CODE) do
@@ -113,7 +136,9 @@ function _M.parse_raw(raw, cap)
             elseif name == "accept-language" and not lang then
                 lang = value
             elseif name == "cookie" then
-                cookie = true
+                if _M.foreign_cookie(value) then
+                    cookie = true
+                end
             end
         end
     end
@@ -184,7 +209,7 @@ function _M.capture()
             presence = _M.presence(h),
             ua = one(h["user-agent"]),
             lang = one(h["accept-language"]),
-            cookie = h["cookie"] ~= nil,
+            cookie = _M.foreign_cookie(h["cookie"]),
         }
     end
     fields.method = ngx.req.get_method()

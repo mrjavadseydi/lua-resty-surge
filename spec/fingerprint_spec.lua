@@ -56,6 +56,22 @@ describe("http fingerprint", function()
         assert(key ~= other)
     end)
 
+    it("ignores the challenge cookie when setting the cookie bit", function()
+        local only = fp.parse_raw("cookie: srg_pow=v1.1.aa.1.ff\r\naccept: */*\r\n", 32)
+        local both = fp.parse_raw("cookie: session=a; srg_pow=v1.1.aa.1.ff\r\naccept: */*\r\n", 32)
+        assert(only.cookie == false)
+        assert(both.cookie == true)
+        local bare = fp.build({
+            ordered = true, order = only.order, method = "GET", http = "11",
+            cookie = only.cookie,
+        })
+        local solved = fp.build({
+            ordered = true, order = only.order, method = "GET", http = "11",
+            cookie = false,
+        })
+        assert(bare == solved)
+    end)
+
     it("stops reading after the cap", function()
         local lines = {}
         for i = 1, 40 do
