@@ -174,6 +174,11 @@ function _M.parse(opts)
         end
     end
 
+    local export_path = opts.export_path
+    if export_path ~= nil and (type(export_path) ~= "string" or export_path == "") then
+        error("surge: export_path must be a file path")
+    end
+
     local feed_dir = opts.feed_dir or "/tmp/surge-feeds"
     if type(feed_dir) ~= "string" or feed_dir == "" then
         error("surge: feed_dir must be a directory path")
@@ -194,6 +199,7 @@ function _M.parse(opts)
         api = api,
         feeds = feeds,
         feed_dir = feed_dir,
+        export_path = export_path,
         dict = dict,
         test_hooks = params.test_hooks and true or false,
     }

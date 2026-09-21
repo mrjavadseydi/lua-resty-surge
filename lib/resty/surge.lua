@@ -23,6 +23,8 @@ local fingerprint = require "resty.surge.fingerprint"
 local challenge = require "resty.surge.challenge"
 local ja4 = require "resty.surge.ja4"
 local sha = require "resty.surge.sha256"
+local export = require "resty.surge.export"
+local metrics = require "resty.surge.metrics"
 
 local _M = { _VERSION = "0.1.0" }
 
@@ -53,6 +55,9 @@ local err_last
 local seq = 0
 local secret_cur, secret_prev
 local secret_ver, secret_prev_ver = 0, 0
+local stats_allowed, stats_limited, stats_challenged, stats_blocked = 0, 0, 0, 0
+local stats_reasons = {}
+local stats_log_at = 0
 
 local function has_prefix(s, p)
     local n = #p
@@ -203,6 +208,87 @@ local function signature(snap)
     return table.concat(parts, "\0")
 end
 
+local function tally(kind, reason)
+    if kind == "allowed" then
+        stats_allowed = stats_allowed + 1
+    elseif kind == "limited" then
+        stats_limited = stats_limited + 1
+    elseif kind == "challenged" then
+        stats_challenged = stats_challenged + 1
+    elseif kind == "blocked" then
+        stats_blocked = stats_blocked + 1
+        if type(reason) == "string" and reason ~= "" then
+            local safe = reason:gsub("[^%w_:]", "_")
+            stats_reasons[safe] = (stats_reasons[safe] or 0) + 1
+        end
+    end
+end
+
+local function flush_stats()
+    if not shared then
+        return
+    end
+    local blocked, limited, challenged = stats_blocked, stats_limited, stats_challenged
+    local reasons = stats_reasons
+    stats_reasons = {}
+    if stats_allowed > 0 then
+        shared:incr("m:allowed", stats_allowed, 0)
+        stats_allowed = 0
+    end
+    if stats_limited > 0 then
+        shared:incr("m:limited", stats_limited, 0)
+        stats_limited = 0
+    end
+    if stats_challenged > 0 then
+        shared:incr("m:challenged", stats_challenged, 0)
+        stats_challenged = 0
+    end
+    if stats_blocked > 0 then
+        shared:incr("m:blocked", stats_blocked, 0)
+        stats_blocked = 0
+    end
+    local known = shared:get("m:reason-names") or ""
+    local grew = false
+    for reason, n in pairs(reasons) do
+        shared:incr("m:r:" .. reason, n, 0)
+        if not known:find(reason, 1, true) then
+            known = known .. reason .. "\n"
+            grew = true
+        end
+    end
+    if grew then
+        shared:set("m:reason-names", known)
+    end
+    local now = ngx.now()
+    if now - stats_log_at < 10 then
+        return
+    end
+    stats_log_at = now
+    if blocked > 0 then
+        ngx.log(ngx.NOTICE, "surge: blocked ", blocked, " requests in the last 10s")
+    end
+    if limited > 0 then
+        ngx.log(ngx.NOTICE, "surge: limited ", limited, " requests in the last 10s")
+    end
+    if challenged > 0 then
+        ngx.log(ngx.NOTICE, "surge: challenged ", challenged, " requests in the last 10s")
+    end
+end
+
+local function log_decisions(prev, list)
+    local old = {}
+    for i = 1, #(prev or {}) do
+        local r = prev[i]
+        old[r.incident or ""] = r.action
+    end
+    for i = 1, #list do
+        local r = list[i]
+        if r.action ~= "observe" and old[r.incident or ""] ~= r.action then
+            ngx.log(ngx.NOTICE, "surge: ", r.message or r.action or "")
+        end
+    end
+end
+
 local function publish(snap)
     local list = snap.list or {}
     for i = 1, #list do
@@ -223,6 +309,12 @@ local function publish(snap)
     install(snap)
     box.ver = ver
     sig = signature(snap)
+    if cfg.export_path then
+        local wrote, werr = export.write(cfg.export_path, snap.list, ngx.now(), 0.9)
+        if not wrote then
+            ngx.log(ngx.ERR, "surge: export failed: ", werr or "")
+        end
+    end
     return true
 end
 
@@ -305,6 +397,14 @@ on_merged = function(merged)
         end
     end
     snap.list = kept
+    if not bench_mode and snap.mode ~= box.mode then
+        ngx.log(ngx.NOTICE, string.format(
+            "surge: mode %s, rps %.0f, baseline %.0f",
+            snap.mode or "", snap.rps or 0, snap.mean or 0))
+    end
+    if not bench_mode and signature(snap) ~= sig then
+        log_decisions(box.list, snap.list)
+    end
     if bench_mode then
         -- Keep the decisions published for the benchmark. The analyzer
         -- would otherwise block the single load-generator address.
@@ -804,6 +904,7 @@ local function on_tick(premature)
     end
     maybe_reload_feeds()
     load_secrets()
+    flush_stats()
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
@@ -917,9 +1018,11 @@ function _M.protect()
     local ok, dec, status = xpcall(protect_inner, debug.traceback)
     if not ok then
         note_error(dec)
+        tally("allowed")
         return
     end
     if dec == "page" then
+        tally("challenged")
         ngx.status = 403
         ngx.header["Content-Type"] = "text/html; charset=utf-8"
         ngx.header["Cache-Control"] = "no-store"
@@ -927,6 +1030,7 @@ function _M.protect()
         return ngx.exit(403)
     end
     if dec == "solved" then
+        tally("allowed")
         ngx.status = 204
         ngx.header["Set-Cookie"] = status
         ngx.header["Cache-Control"] = "no-store"
@@ -934,6 +1038,14 @@ function _M.protect()
         return ngx.exit(204)
     end
     if dec then
+        local reason = dec.reason
+        if status == 429 or dec.action == "limit" then
+            tally("limited", reason)
+        elseif dec.action == "challenge" then
+            tally("challenged", reason)
+        else
+            tally("blocked", reason)
+        end
         if status then
             dec = {
                 incident = dec.incident,
@@ -945,7 +1057,9 @@ function _M.protect()
             }
         end
         deny(dec)
+        return
     end
+    tally("allowed")
 end
 
 local function early_hit(bin, family)
@@ -1063,6 +1177,30 @@ function _M.status()
     end
 
     local dict = state and state.dict
+    if ngx.var.arg_format == "prometheus" then
+        local reasons = {}
+        if dict then
+            local names = dict:get("m:reason-names") or ""
+            for reason in names:gmatch("[^\n]+") do
+                reasons[reason] = dict:get("m:r:" .. reason) or 0
+            end
+        end
+        ngx.header["Content-Type"] = "text/plain; version=0.0.4"
+        ngx.print(metrics.prometheus({
+            mode = box.mode,
+            decisions = box.list and #box.list or 0,
+            feeds = box.feed_report,
+            totals = {
+                allowed = dict and dict:get("m:allowed") or 0,
+                limited = dict and dict:get("m:limited") or 0,
+                challenged = dict and dict:get("m:challenged") or 0,
+                blocked = dict and dict:get("m:blocked") or 0,
+            },
+            reasons = reasons,
+        }))
+        return
+    end
+
     local view = {}
     local list = box.list or {}
     for i = 1, #list do
