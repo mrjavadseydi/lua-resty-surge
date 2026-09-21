@@ -30,6 +30,7 @@ local agent_on = false
 local an
 local on_merged
 local started = false
+local bench_mode
 local cfg
 local state
 local box
@@ -304,7 +305,12 @@ on_merged = function(merged)
         end
     end
     snap.list = kept
-    if signature(snap) ~= sig then
+    if bench_mode then
+        -- Keep the decisions published for the benchmark. The analyzer
+        -- would otherwise block the single load-generator address.
+        box.mode = bench_mode
+        box.sample = sample_of(bench_mode)
+    elseif signature(snap) ~= sig then
         publish(snap)
     end
     box.rps = snap.rps
@@ -312,6 +318,10 @@ on_merged = function(merged)
     box.sigma = snap.sigma
     box.entropy = snap.entropy
     box.warming = snap.warming
+    if bench_mode then
+        box.mode = bench_mode
+        box.sample = sample_of(bench_mode)
+    end
     -- The next start() continues this clock. Otherwise every reload spends
     -- the whole warmup with no automatic decisions.
     local text = baseline.export(an.baseline)
@@ -578,13 +588,17 @@ local function protect_inner()
             end
         end
     end
-    local family, bin = clientip.client_addr(raw, {
-        trusted = cfg.trusted,
-        xff = xff,
-        realip_rewritten = rewritten,
-    })
+    local family, bin = clientip.identity(raw)
     if not family then
         return nil
+    end
+    -- No options table on this path. client_addr() allocates one and is
+    -- only used when the peer is a trusted proxy.
+    if xff then
+        local fam2, bin2 = clientip.client_from_xff(xff, cfg.trusted, 8)
+        if fam2 and not rewritten then
+            family, bin = fam2, bin2
+        end
     end
     local good = family == "v6" and box.good6 or box.good4
     if allowed_ip(family, bin) or allowed_path() or ipdb.hit(good, bin) then
@@ -1078,6 +1092,21 @@ function _M.status()
         feeds = box.feed_report,
     }
     ngx.print(cjson.encode(body))
+end
+
+-- Pin the mode for a benchmark. Refuses to run unless test_hooks is on,
+-- so a production config cannot stick the process in attack mode.
+function _M._bench_mode(mode)
+    if not cfg or not cfg.test_hooks then
+        return nil, "surge: test hooks are off"
+    end
+    if mode ~= "normal" and mode ~= "elevated" and mode ~= "attack" then
+        return nil, "surge: bad bench mode"
+    end
+    bench_mode = mode
+    box.mode = mode
+    box.sample = sample_of(mode)
+    return true
 end
 
 -- Add manual decisions and publish. Kept across analyzer ticks because
