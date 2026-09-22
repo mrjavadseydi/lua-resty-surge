@@ -38,14 +38,14 @@ function _M.lines(list, now, min_confidence)
             local conf = r.confidence or (r.manual and 1 or 0)
             if r.manual or conf >= floor_c then
                 local addr = r.family == "v6" and ipv6(r.key) or ipv4(r.key)
-                if addr then
-                    local ttl = r.ttl or 0
-                    if r.until_ts and now then
-                        local left = math.floor(r.until_ts - now)
-                        if left > 0 then
-                            ttl = left
-                        end
-                    end
+                local ttl
+                if r.until_ts and now then
+                    -- A record past until_ts must not be given a fresh timeout.
+                    ttl = math.floor(r.until_ts - now)
+                else
+                    ttl = r.ttl or 0
+                end
+                if addr and ttl > 0 then
                     out[#out + 1] = string.format("%s %d %s %d %s",
                         r.family == "v6" and "v6" or "v4",
                         r.bits or (#r.key * 8), addr, ttl, r.incident or "-")

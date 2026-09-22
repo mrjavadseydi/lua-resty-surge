@@ -207,6 +207,7 @@ function _M.run(ctx, merged, now, previous)
             st.stage = rec.action or st.stage
             st.ttl = rec.ttl or st.ttl
             st.until_ts = rec_until
+            st.confidence = rec.confidence or 0
             st.last = rec
         elseif rec_until > (st.until_ts or 0) then
             -- A snapshot must not shorten a TTL this process already extended.
@@ -216,6 +217,9 @@ function _M.run(ctx, merged, now, previous)
             if rec.action and rec.action ~= "observe" then
                 st.stage = rec.action
             end
+        end
+        if rec.confidence and rec.confidence > (st.confidence or 0) then
+            st.confidence = rec.confidence
         end
         st.last_seen = st.last_seen or now
         return id, st

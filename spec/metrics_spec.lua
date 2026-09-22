@@ -49,4 +49,35 @@ describe("kernel export", function()
         os.remove(path)
         assert(body:find("10.1.2.0", 1, true) or body:find("10.1.2", 1, true))
     end)
+
+    it("drops an expired block and a low-confidence automatic one", function()
+        local lines = export.lines({
+            {
+                family = "v4", bits = 32, key = string.char(10, 1, 2, 3),
+                action = "block", confidence = 0.95, ttl = 600,
+                until_ts = 1000, incident = "gone",
+            },
+            {
+                family = "v4", bits = 32, key = string.char(10, 4, 5, 6),
+                action = "block", confidence = 0.5, ttl = 600,
+                until_ts = 5000, incident = "low",
+            },
+            {
+                family = "v4", bits = 32, key = string.char(10, 7, 8, 9),
+                action = "block", confidence = 0.95, ttl = 600,
+                until_ts = 1900, incident = "stay",
+            },
+        }, 1500, 0.9)
+        assert(#lines == 1)
+        assert(lines[1]:find("10.7.8.9", 1, true))
+        assert(lines[1]:find(" 400 ", 1, true))
+    end)
+
+    it("does not treat one reason name as a prefix of another", function()
+        local blob = "reputation:firehol_level1\nmanual_x\n"
+        assert(metrics.has_line(blob, "reputation:firehol_level1"))
+        assert(not metrics.has_line(blob, "reputation:firehol_level"))
+        assert(not metrics.has_line(blob, "manual"))
+        assert(metrics.has_line(blob, "manual_x"))
+    end)
 end)

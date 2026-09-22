@@ -423,4 +423,25 @@ describe("analyzer", function()
         end
         assert(bot_hit, "majority fingerprint was not escalated")
     end)
+
+    it("keeps confidence when a block is adopted from the snapshot", function()
+        local ctx = analyzer.new(params())
+        local now = 50
+        local prev = {
+            {
+                family = "v4", bits = 32, key = attacker,
+                action = "block", reason = "heavy_hitter",
+                message = "held", ttl = 60, until_ts = now + 30,
+                confidence = 0.95, incident = "srg-keep",
+            },
+        }
+        local snap = analyzer.run(ctx, absent(), now, prev)
+        local rec = find(snap.list, attacker, "block")
+        assert(rec, "adopted block missing")
+        assert(math.abs((rec.confidence or 0) - 0.95) < 0.0001)
+        snap = analyzer.run(ctx, flood(), now + 1, snap.list)
+        rec = find(snap.list, attacker, "block")
+        assert(rec, "block missing on the next tick")
+        assert((rec.confidence or 0) > 0.5, tostring(rec.confidence))
+    end)
 end)

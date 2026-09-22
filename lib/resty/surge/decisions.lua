@@ -186,6 +186,15 @@ function _M.encode(snap)
         -- A block that lives only in worker 0's memory is gone on the next tick.
         parts[#parts + 1] = char(r.manual and 1 or 0)
         parts[#parts + 1] = u32(math.floor(r.until_ts or 0))
+        -- Confidence has to cross workers. The export uses it, and a leader
+        -- that only sees the snapshot would otherwise treat it as zero.
+        local conf = math.floor((r.confidence or 0) * 10000)
+        if conf < 0 then
+            conf = 0
+        elseif conf > 10000 then
+            conf = 10000
+        end
+        parts[#parts + 1] = u16(conf)
     end
     return table.concat(parts)
 end
@@ -234,7 +243,9 @@ function _M.decode(blob)
         local flags = byte(blob, i)
         local until_ts
         until_ts, i = r32(blob, i + 1)
-        if not incident or not ttl or not until_ts then
+        local conf_i
+        conf_i, i = r16(blob, i)
+        if not incident or not ttl or not until_ts or not conf_i then
             return nil, "truncated tail"
         end
         list[k] = {
@@ -251,6 +262,7 @@ function _M.decode(blob)
             incident = incident,
             manual = flags == 1,
             until_ts = until_ts ~= 0 and until_ts or nil,
+            confidence = conf_i > 0 and (conf_i / 10000) or nil,
         }
     end
     return { mode = mode, list = list }

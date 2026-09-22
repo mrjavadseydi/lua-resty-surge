@@ -61,7 +61,7 @@ Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ...
 
 ## Limits
 
-This is not a firewall for volumetric L3 or L4 floods. A repeat block can be written to `export_path` for `examples/nftables-sidecar.sh` to load into nftables. The module never runs a shell command itself.
+This is not a firewall for volumetric L3 or L4 floods. A block can be written to `export_path` for `examples/nftables-sidecar.sh` to load into nftables. That file is not written while `dry_run` is on, so a dry run cannot drop clients in the kernel. The module never runs a shell command itself.
 
 The rate limit is per worker, so a client that hits every worker can burst about `workers` times the configured burst. The sketch overestimates a little. Fingerprints are computed only after the mode leaves normal, because reading headers on every quiet request costs too much. `early()` cannot see a path allow. ASN lookup is not included.
 

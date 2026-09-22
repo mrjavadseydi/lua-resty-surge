@@ -69,6 +69,7 @@ describe("decision snapshot", function()
         assert(r.incident == "srg-1")
         assert(r.manual == false)
         assert(r.until_ts == nil)
+        assert(r.confidence == nil)
     end)
 
     it("keeps a manual block and its expiry across a snapshot", function()
@@ -94,6 +95,21 @@ describe("decision snapshot", function()
         local r = decisions.decode(decisions.encode(snap)).list[1]
         assert(r.manual == true)
         assert(r.until_ts == 1700000000)
+        local auto = {
+            mode = "attack",
+            list = {
+                {
+                    family = "v4", bits = 32, key = "\10\0\0\9",
+                    action = "block", reason = "heavy_hitter",
+                    message = "auto", close = false, status = 403,
+                    ttl = 60, until_ts = 1700000060, confidence = 0.95,
+                    incident = "srg-auto",
+                },
+            },
+        }
+        local kept = decisions.decode(decisions.encode(auto)).list[1]
+        assert(math.abs(kept.confidence - 0.95) < 0.0001)
+        assert(kept.until_ts == 1700000060)
         local fp = decisions.decode(decisions.encode({
             mode = "attack",
             list = {

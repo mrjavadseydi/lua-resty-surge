@@ -7,6 +7,18 @@ local function num(v)
     return string.format("%.0f", v)
 end
 
+-- Exact line match. A substring check treats "manual" as already present
+-- inside "manual_x", and the shorter series never appears.
+function _M.has_line(blob, line)
+    if type(blob) ~= "string" or blob == "" or type(line) ~= "string" or line == "" then
+        return false
+    end
+    if blob:sub(-1) ~= "\n" then
+        blob = blob .. "\n"
+    end
+    return ("\n" .. blob):find("\n" .. line .. "\n", 1, true) ~= nil
+end
+
 function _M.prometheus(s)
     local lines = {
         "# HELP surge_mode 0 normal, 1 elevated, 2 attack",

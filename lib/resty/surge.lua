@@ -58,6 +58,7 @@ local secret_ver, secret_prev_ver = 0, 0
 local stats_allowed, stats_limited, stats_challenged, stats_blocked = 0, 0, 0, 0
 local stats_reasons = {}
 local stats_log_at = 0
+local name_retry = {}
 
 local function has_prefix(s, p)
     local n = #p
@@ -224,11 +225,13 @@ local function tally(kind, reason)
     end
 end
 
+local remember_reasons
+local log_window
+
 local function flush_stats()
     if not shared then
         return
     end
-    local blocked, limited, challenged = stats_blocked, stats_limited, stats_challenged
     local reasons = stats_reasons
     stats_reasons = {}
     if stats_allowed > 0 then
@@ -247,11 +250,38 @@ local function flush_stats()
         shared:incr("m:blocked", stats_blocked, 0)
         stats_blocked = 0
     end
-    local known = shared:get("m:reason-names") or ""
-    local grew = false
+    local pending = {}
     for reason, n in pairs(reasons) do
         shared:incr("m:r:" .. reason, n, 0)
-        if not known:find(reason, 1, true) then
+        pending[#pending + 1] = reason
+    end
+    remember_reasons(pending)
+    log_window()
+end
+
+-- The name list is one shared string. add() is the lock so two workers
+-- cannot each write a copy that drops the other's new reason.
+function remember_reasons(pending)
+    for i = 1, #pending do
+        name_retry[pending[i]] = true
+    end
+    if not shared or not next(name_retry) then
+        return
+    end
+    local deadline = ngx.now() + 0.05
+    while not shared:add("m:reason-lock", 1, 0.5) do
+        if ngx.now() >= deadline then
+            return
+        end
+        ngx.sleep(0.001)
+    end
+    local known = shared:get("m:reason-names") or ""
+    local grew = false
+    for reason in pairs(name_retry) do
+        if not metrics.has_line(known, reason) then
+            if known ~= "" and known:sub(-1) ~= "\n" then
+                known = known .. "\n"
+            end
             known = known .. reason .. "\n"
             grew = true
         end
@@ -259,19 +289,50 @@ local function flush_stats()
     if grew then
         shared:set("m:reason-names", known)
     end
+    name_retry = {}
+    shared:delete("m:reason-lock")
+end
+
+-- One line per 10s from the shared counters, not from this tick's locals.
+-- Worker 0 logs it. Every worker has already incr'd the same keys.
+function log_window()
+    if not state or state.id ~= 0 then
+        return
+    end
     local now = ngx.now()
+    if stats_log_at == 0 then
+        stats_log_at = now
+        shared:set("m:log:blocked", shared:get("m:blocked") or 0)
+        shared:set("m:log:limited", shared:get("m:limited") or 0)
+        shared:set("m:log:challenged", shared:get("m:challenged") or 0)
+        return
+    end
     if now - stats_log_at < 10 then
         return
     end
     stats_log_at = now
-    if blocked > 0 then
-        ngx.log(ngx.NOTICE, "surge: blocked ", blocked, " requests in the last 10s")
+    local function delta(name)
+        local cur = shared:get("m:" .. name) or 0
+        local prev = shared:get("m:log:" .. name) or 0
+        shared:set("m:log:" .. name, cur)
+        local d = cur - prev
+        if d < 0 then
+            d = cur
+        end
+        return d
     end
-    if limited > 0 then
-        ngx.log(ngx.NOTICE, "surge: limited ", limited, " requests in the last 10s")
+    local blocked_n = delta("blocked")
+    local limited_n = delta("limited")
+    local challenged_n = delta("challenged")
+    if blocked_n > 0 then
+        ngx.log(ngx.NOTICE, "surge: blocked ", blocked_n, " requests in the last 10s")
     end
-    if challenged > 0 then
-        ngx.log(ngx.NOTICE, "surge: challenged ", challenged, " requests in the last 10s")
+    if limited_n > 0 then
+        ngx.log(ngx.NOTICE, "surge: limited ", limited_n, " requests in the last 10s")
+    end
+    if challenged_n > 0 then
+        ngx.log(ngx.NOTICE, "surge: challenged ", challenged_n,
+            " requests in the last 10s")
     end
 end
 
@@ -309,7 +370,8 @@ local function publish(snap)
     install(snap)
     box.ver = ver
     sig = signature(snap)
-    if cfg.export_path then
+    -- Dry run must not install kernel blocks. The HTTP request is still allowed.
+    if cfg.export_path and not cfg.dry_run then
         local wrote, werr = export.write(cfg.export_path, snap.list, ngx.now(), 0.9)
         if not wrote then
             ngx.log(ngx.ERR, "surge: export failed: ", werr or "")
