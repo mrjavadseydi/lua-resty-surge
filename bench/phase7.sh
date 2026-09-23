@@ -68,6 +68,10 @@ P=/tmp/surge-bench7-normal
 write_http "$P" 18231 \
     'require("resty.surge").start({ advanced = { hard_ip_rps = 1e9, warmup = 3600 } })' \
     'location = /bare { return 200 "ok\n"; }
+        location = /lua {
+            access_by_lua_block { }
+            content_by_lua_block { ngx.print("ok\n") }
+        }
         location = /open {
             access_by_lua_block { require("resty.surge").protect() }
             content_by_lua_block { ngx.print("ok\n") }
@@ -75,11 +79,18 @@ write_http "$P" 18231 \
         location = /gc {
             content_by_lua_block {
                 local s = require("resty.surge")
+                -- Warm up first, so trace compilation is not counted.
+                for _ = 1, 20000 do s.protect() end
                 collectgarbage("collect")
                 local before = collectgarbage("count")
                 for _ = 1, 20000 do s.protect() end
                 local after = collectgarbage("count")
-                ngx.say(string.format("%.3f", after - before))
+                ngx.update_time()
+                local t0 = ngx.now()
+                for _ = 1, 200000 do s.protect() end
+                ngx.update_time()
+                ngx.say(string.format("%.3f kb, %.0f ns per call", after - before,
+                    (ngx.now() - t0) / 200000 * 1e9))
             }
         }'
 pid=$(start_one "$P")
@@ -88,10 +99,13 @@ wait_http 18231 /bare
     echo "===== (a) no module, return 200 ====="
     wrk -t2 -c32 -d"$DUR" --latency "http://127.0.0.1:18231/bare"
     echo
+    echo "===== (a2) empty access_by_lua, same content_by_lua (baseline for protect) ====="
+    wrk -t2 -c32 -d"$DUR" --latency "http://127.0.0.1:18231/lua"
+    echo
     echo "===== (b) protect, normal mode ====="
     wrk -t2 -c32 -d"$DUR" --latency "http://127.0.0.1:18231/open"
     echo
-    echo "===== gc kb over 20000 protect() calls, normal mode ====="
+    echo "===== gc kb over 20000 protect() calls after 20000 warmup calls (ns over 200000), normal mode ====="
     curl -s "http://127.0.0.1:18231/gc"
     echo
 } >> "$OUT"
@@ -119,11 +133,18 @@ write_http "$P" 18232 \
         location = /gc {
             content_by_lua_block {
                 local s = require("resty.surge")
+                -- Warm up first, so trace compilation is not counted.
+                for _ = 1, 20000 do s.protect() end
                 collectgarbage("collect")
                 local before = collectgarbage("count")
                 for _ = 1, 20000 do s.protect() end
                 local after = collectgarbage("count")
-                ngx.say(string.format("%.3f", after - before))
+                ngx.update_time()
+                local t0 = ngx.now()
+                for _ = 1, 200000 do s.protect() end
+                ngx.update_time()
+                ngx.say(string.format("%.3f kb, %.0f ns per call", after - before,
+                    (ngx.now() - t0) / 200000 * 1e9))
             }
         }'
 pid=$(start_one "$P")
@@ -142,7 +163,7 @@ fi
     echo "===== (d) block decision ====="
     wrk -t2 -c32 -d"$DUR" --latency "http://127.0.0.1:18232/blocked"
     echo
-    echo "===== gc kb over 20000 protect() calls, attack mode ====="
+    echo "===== gc kb over 20000 protect() calls after 20000 warmup calls (ns over 200000), attack mode ====="
     curl -s "http://127.0.0.1:18232/gc"
     echo
 } >> "$OUT"

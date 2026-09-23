@@ -1,4 +1,4 @@
-date 2026-09-23T11:49:18Z
+date 2026-09-23T14:24:01Z
 uname Linux 6.4.16-linuxkit #1 SMP PREEMPT Thu Nov 16 10:49:20 UTC 2023 aarch64
 nproc 1
 openresty nginx version: openresty/1.31.1.1
@@ -10,69 +10,84 @@ Docker image lua-resty-surge/harness (openresty 1.31.1.1). Numbers are from this
 Running 8s test @ http://127.0.0.1:18231/bare
   2 threads and 32 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   349.69us  344.86us  11.69ms   99.02%
-    Req/Sec    48.96k     2.21k   58.31k    88.89%
+    Latency   641.94us  192.21us   7.49ms   90.48%
+    Req/Sec    25.18k     1.39k   31.02k    83.75%
   Latency Distribution
-     50%  323.00us
-     75%  345.00us
-     90%  367.00us
-     99%  665.00us
-  789148 requests in 8.10s, 117.40MB read
-Requests/sec:  97397.70
-Transfer/sec:     14.49MB
+     50%  628.00us
+     75%  685.00us
+     90%  752.00us
+     99%    1.14ms
+  400797 requests in 8.00s, 59.63MB read
+Requests/sec:  50083.76
+Transfer/sec:      7.45MB
+
+===== (a2) empty access_by_lua, same content_by_lua (baseline for protect) =====
+Running 8s test @ http://127.0.0.1:18231/lua
+  2 threads and 32 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   717.27us  366.83us  14.00ms   97.76%
+    Req/Sec    22.98k     1.19k   26.24k    71.88%
+  Latency Distribution
+     50%  688.00us
+     75%  769.00us
+     90%    0.85ms
+     99%    1.50ms
+  365928 requests in 8.00s, 61.07MB read
+Requests/sec:  45712.47
+Transfer/sec:      7.63MB
 
 ===== (b) protect, normal mode =====
 Running 8s test @ http://127.0.0.1:18231/open
   2 threads and 32 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   370.61us   91.49us   4.78ms   95.11%
-    Req/Sec    43.40k     4.47k   97.89k    99.38%
+    Latency   735.77us  266.51us   6.58ms   94.12%
+    Req/Sec    22.22k     1.86k   28.19k    83.12%
   Latency Distribution
-     50%  370.00us
-     75%  394.00us
-     90%  416.00us
-     99%  505.00us
-  695657 requests in 8.10s, 116.10MB read
-Requests/sec:  85889.56
-Transfer/sec:     14.33MB
+     50%  719.00us
+     75%  790.00us
+     90%  849.00us
+     99%    1.46ms
+  353526 requests in 8.00s, 59.00MB read
+Requests/sec:  44171.13
+Transfer/sec:      7.37MB
 
-===== gc kb over 20000 protect() calls, normal mode =====
-15.188
+===== gc kb over 20000 protect() calls after 20000 warmup calls (ns over 200000), normal mode =====
+9.398 kb, 105 ns per call
 
 ===== (c) protect, attack mode, request allowed =====
 mode pinned with _bench_mode; test_hooks required. One wrk client would otherwise be blocked as the attacker.
 Running 8s test @ http://127.0.0.1:18232/attack
   2 threads and 32 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   477.84us  135.21us   5.67ms   90.89%
-    Req/Sec    33.83k     1.01k   36.67k    71.88%
+    Latency     0.99ms    2.18ms  67.25ms   99.36%
+    Req/Sec    18.64k     2.12k   41.42k    95.65%
   Latency Distribution
-     50%  469.00us
-     75%  509.00us
-     90%  556.00us
-     99%  791.00us
-  538458 requests in 8.01s, 89.86MB read
-Requests/sec:  67260.92
-Transfer/sec:     11.23MB
+     50%  843.00us
+     75%    0.93ms
+     90%    1.05ms
+     99%    2.04ms
+  298465 requests in 8.10s, 49.81MB read
+Requests/sec:  36848.98
+Transfer/sec:      6.15MB
 
 ===== (d) block decision =====
 Running 8s test @ http://127.0.0.1:18232/blocked
   2 threads and 32 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   431.65us   88.99us   3.93ms   87.86%
-    Req/Sec    37.22k     4.16k   88.13k    99.38%
+    Latency     0.86ms  247.67us   8.26ms   87.69%
+    Req/Sec    18.69k     2.10k   42.65k    96.89%
   Latency Distribution
-     50%  430.00us
-     75%  466.00us
-     90%  502.00us
-     99%  633.00us
-  596306 requests in 8.10s, 171.74MB read
-  Non-2xx or 3xx responses: 596306
-Requests/sec:  73621.09
-Transfer/sec:     21.20MB
+     50%  844.00us
+     75%    0.94ms
+     90%    1.06ms
+     99%    1.60ms
+  299440 requests in 8.10s, 86.24MB read
+  Non-2xx or 3xx responses: 299440
+Requests/sec:  36968.79
+Transfer/sec:     10.65MB
 
-===== gc kb over 20000 protect() calls, attack mode =====
-932.488
+===== gc kb over 20000 protect() calls after 20000 warmup calls (ns over 200000), attack mode =====
+788.803 kb, 2955 ns per call
 
 ===== (e) early() closes the handshake =====
 curl http_code was 000 (000 means the handshake did not complete).
@@ -86,8 +101,8 @@ Running 8s test @ https://127.0.0.1:18233/
      75%    0.00us
      90%    0.00us
      99%    0.00us
-  0 requests in 8.06s, 0.00B read
-  Socket errors: connect 100767, read 0, write 0, timeout 0
+  0 requests in 8.08s, 0.00B read
+  Socket errors: connect 52626, read 0, write 0, timeout 0
 Requests/sec:      0.00
 Transfer/sec:       0.00B
 

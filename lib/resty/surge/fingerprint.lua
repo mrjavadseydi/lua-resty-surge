@@ -62,6 +62,11 @@ function _M.crc32(s)
     return c
 end
 
+-- Same IEEE CRC-32, in C. The Lua loop stays for plain-luajit specs.
+if ngx and ngx.crc32_short then
+    _M.crc32 = ngx.crc32_short
+end
+
 local function hex8(n)
     return string.format("%08x", n)
 end
@@ -176,7 +181,7 @@ function _M.build(fields)
     end
     local key = tag .. method .. http .. seq .. hex8(_M.crc32(fields.ua or ""))
         .. first_lang(fields.lang) .. (fields.cookie and "1" or "0") .. ja
-    return key, hex8(_M.crc32(key))
+    return key
 end
 
 local function one(v)

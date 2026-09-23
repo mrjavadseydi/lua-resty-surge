@@ -12,6 +12,7 @@ local decisions = require "resty.surge.decisions"
 local respond = require "resty.surge.respond"
 local log = require "resty.surge.log"
 local sketch = require "resty.surge.sketch"
+local hash_pair, add_hashed = sketch.hash_pair, sketch.add_hashed
 local topk = require "resty.surge.topk"
 local sync = require "resty.surge.sync"
 local analyzer = require "resty.surge.analyzer"
@@ -25,6 +26,8 @@ local ja4 = require "resty.surge.ja4"
 local sha = require "resty.surge.sha256"
 local export = require "resty.surge.export"
 local metrics = require "resty.surge.metrics"
+local messages = require "resty.surge.messages"
+local cjson = require "cjson.safe"
 
 local _M = { _VERSION = "0.1.0" }
 
@@ -117,9 +120,16 @@ local function index_fp(list)
 end
 
 local function install(snap)
+    -- Limiter state lives only as long as its decision.
+    local live = {}
     for i = 1, #snap.list do
-        respond.build(snap.list[i], cfg.expose)
+        local r = snap.list[i]
+        respond.build(r, cfg.expose)
+        if r.incident and tats[r.incident] then
+            live[r.incident] = tats[r.incident]
+        end
     end
+    tats = live
     local t4, t6 = decisions.build(snap.list)
     box.trie4 = t4
     box.trie6 = t6
@@ -132,17 +142,6 @@ local function install(snap)
     box.sigma = snap.sigma
     box.entropy = snap.entropy
     box.fp, box.fp_n = index_fp(snap.list)
-end
-
-local function gate_for(sk)
-    local admit = cfg.params.admit_share
-    return function(key)
-        local total = sketch.total(sk)
-        if total <= 0 then
-            return true
-        end
-        return sketch.query(sk, key) >= admit * total
-    end
 end
 
 local function dim(slot, suffix, sk, tk)
@@ -178,12 +177,12 @@ local function make_state(dict, id)
         install = install,
         merged = {},
         dims = {
-            dim(prefix .. "i4", "i4", sk_ip4, topk.new(k, gate_for(sk_ip4))),
-            dim(prefix .. "i6", "i6", sk_ip6, topk.new(k, gate_for(sk_ip6))),
+            dim(prefix .. "i4", "i4", sk_ip4, topk.new(k)),
+            dim(prefix .. "i6", "i6", sk_ip6, topk.new(k)),
             dim(prefix .. "s4", "s4", sk_sub4, topk.new(k)),
             dim(prefix .. "s6", "s6", sk_sub6, topk.new(k)),
-            dim(prefix .. "u", "u", sk_uri, topk.new(k, gate_for(sk_uri))),
-            dim(prefix .. "f", "f", sk_fp, topk.new(k, gate_for(sk_fp))),
+            dim(prefix .. "u", "u", sk_uri, topk.new(k)),
+            dim(prefix .. "f", "f", sk_fp, topk.new(k)),
         },
     }
     -- Named handles for the request path. The dims array is what the timer walks.
@@ -350,7 +349,7 @@ local function log_decisions(prev, list)
     end
 end
 
-local function publish(snap)
+local function publish(snap, snap_sig)
     local list = snap.list or {}
     for i = 1, #list do
         if not list[i].body_html then
@@ -369,7 +368,7 @@ local function publish(snap)
     end
     install(snap)
     box.ver = ver
-    sig = signature(snap)
+    sig = snap_sig or signature(snap)
     -- Dry run must not install kernel blocks. The HTTP request is still allowed.
     if cfg.export_path and not cfg.dry_run then
         local wrote, werr = export.write(cfg.export_path, snap.list, ngx.now(), 0.9)
@@ -436,8 +435,81 @@ local function maybe_rotate_secret(now)
     load_secrets()
 end
 
+-- A manual decision from a parsed CIDR. Kept across analyzer ticks.
+local function manual_record(it, rule, now)
+    seq = seq + 1
+    local ttl = it.ttl or cfg.params.ttl_base
+    return {
+        family = rule.v6 and "v6" or "v4",
+        key = rule.bin,
+        bits = rule.bits,
+        action = it.action or "block",
+        reason = it.reason or "manual",
+        message = it.message or it.reason or "manual block",
+        uri = it.uri,
+        close = it.close and true or false,
+        status = it.status or 403,
+        ttl = ttl,
+        until_ts = now + ttl,
+        manual = it.manual ~= false,
+        incident = it.incident or string.format("srg-%x-%x", state.id or 0, seq),
+    }
+end
+
+-- True when decision `r` is exactly the network `rule` names. Auto /24 and
+-- /64 keys are stored as the prefix bytes only, so pad before comparing.
+local function same_net(r, rule)
+    if r.family ~= (rule.v6 and "v6" or "v4") or r.bits ~= rule.bits then
+        return false
+    end
+    local key = r.key or ""
+    if #key < #rule.bin then
+        key = key .. string.rep("\0", #rule.bin - #key)
+    end
+    return clientip.matches(rule, key)
+end
+
+-- status() queues block/unblock here instead of publishing from whatever
+-- worker served it. A worker's list can be a tick stale, and publishing it
+-- would drop a live block the leader then forgets. The leader is the only
+-- writer of the snapshot.
+local function apply_ops(now)
+    local dict = state.dict
+    local list = box.list or {}
+    local changed = false
+    for _ = 1, 256 do
+        local op = dict:lpop("ops")
+        if not op then
+            break
+        end
+        local kind, arg, ttl_s = op:match("^(%a)%z(.-)%z(.*)$")
+        local ttl = tonumber(ttl_s) or cfg.params.ttl_base
+        local rule = arg and clientip.parse_cidr(arg)
+        if kind == "b" and rule then
+            list[#list + 1] = manual_record({ ttl = ttl }, rule, now)
+            changed = true
+        elseif kind == "u" then
+            local keep = {}
+            for i = 1, #list do
+                local r = list[i]
+                if r.incident == arg or (rule and r.family ~= "fp" and same_net(r, rule)) then
+                    dict:set("supk:" .. r.family .. ":" .. r.key, 1, ttl)
+                else
+                    keep[#keep + 1] = r
+                end
+            end
+            list = keep
+            changed = true
+        end
+    end
+    if changed then
+        box.list = list
+    end
+end
+
 on_merged = function(merged)
     maybe_rotate_secret(ngx.now())
+    apply_ops(ngx.now())
     -- Another leader may have saved a newer clock while this worker waited
     -- on the lease. Continue from that snapshot instead of overwriting it.
     local saved = state.dict:get("baseline")
@@ -464,26 +536,29 @@ on_merged = function(merged)
             "surge: mode %s, rps %.0f, baseline %.0f",
             snap.mode or "", snap.rps or 0, snap.mean or 0))
     end
-    if not bench_mode and signature(snap) ~= sig then
-        log_decisions(box.list, snap.list)
-    end
+    local snap_sig = signature(snap)
     if bench_mode then
         -- Keep the decisions published for the benchmark. The analyzer
         -- would otherwise block the single load-generator address.
         box.mode = bench_mode
         box.sample = sample_of(bench_mode)
-    elseif signature(snap) ~= sig then
-        publish(snap)
+    elseif snap_sig ~= sig then
+        log_decisions(box.list, snap.list)
+        publish(snap, snap_sig)
     end
     box.rps = snap.rps
     box.mean = snap.mean
     box.sigma = snap.sigma
     box.entropy = snap.entropy
     box.warming = snap.warming
-    if bench_mode then
-        box.mode = bench_mode
-        box.sample = sample_of(bench_mode)
-    end
+    -- Only the leader computes these. status() on any worker reads this copy.
+    state.dict:set("stat", cjson.encode({
+        rps = snap.rps,
+        mean = snap.mean,
+        sigma = snap.sigma,
+        entropy = snap.entropy,
+        warming = snap.warming and true or false,
+    }), state.tick * 8)
     -- The next start() continues this clock. Otherwise every reload spends
     -- the whole warmup with no automatic decisions.
     local text = baseline.export(an.baseline)
@@ -497,14 +572,19 @@ on_merged = function(merged)
     end
 end
 
-local function allowed_ip(family, bin)
-    local list = family == "v6" and allow6 or allow4
-    for i = 1, #list do
-        if clientip.matches(list[i], bin) then
-            return true
-        end
+local function rule_trie(rules)
+    if #rules == 0 then
+        return nil
     end
-    return false
+    local t = decisions.new_trie()
+    for i = 1, #rules do
+        decisions.insert(t, rules[i].bin, rules[i].bits, true)
+    end
+    return t
+end
+
+local function allowed_ip(family, bin)
+    return ipdb.hit(family == "v6" and allow6 or allow4, bin) ~= nil
 end
 
 local function allowed_path()
@@ -533,12 +613,17 @@ local function accept_dec(dec)
     return uri ~= nil and has_prefix(uri, p)
 end
 
-local function prefix_hit(sk, full, nbytes)
-    local total = sketch.total(sk)
-    if total <= 0 then
-        return false
+-- One hash per key. The estimate after the add is the top-K gate: a new
+-- key enters only at admit_share of this window.
+local function tally_key(d, key, nbytes)
+    local sk = d.sketch
+    local h1, h2 = hash_pair(key, nbytes)
+    local admit = add_hashed(sk, h1, h2, 1) >= cfg.params.admit_share * sk.total
+    if nbytes then
+        topk.add_prefix(d.topk, key, nbytes, h1, 1, admit)
+    else
+        topk.add(d.topk, key, 1, admit)
     end
-    return sketch.query(sk, full, nbytes) >= cfg.params.admit_share * total
 end
 
 local function observe(family, bin, fp_key)
@@ -550,40 +635,20 @@ local function observe(family, bin, fp_key)
     sample_n = 0
 
     if family == "v4" then
-        local d = state.ip4
-        sketch.add(d.sketch, bin, 1)
-        topk.add(d.topk, bin, 1)
-        local sub = state.sub4
-        sketch.add(sub.sketch, bin, 1, 3)
-        local h = sketch.hash_pair(bin, 3)
-        topk.add_prefix(sub.topk, bin, 3, h, 1, prefix_hit(sub.sketch, bin, 3))
+        tally_key(state.ip4, bin)
+        tally_key(state.sub4, bin, 3)
     else
-        local d = state.ip6
-        sketch.add(d.sketch, bin, 1)
-        topk.add(d.topk, bin, 1)
-        local sub = state.sub6
-        sketch.add(sub.sketch, bin, 1, 8)
-        local h = sketch.hash_pair(bin, 8)
-        topk.add_prefix(sub.topk, bin, 8, h, 1, prefix_hit(sub.sketch, bin, 8))
+        tally_key(state.ip6, bin)
+        tally_key(state.sub6, bin, 8)
     end
 
     local uri = ngx.var.uri
     if not uri or uri == "" then
         return
     end
-    local ud = state.uri
-    if #uri > 128 then
-        sketch.add(ud.sketch, uri, 1, 128)
-        local h = sketch.hash_pair(uri, 128)
-        topk.add_prefix(ud.topk, uri, 128, h, 1, prefix_hit(ud.sketch, uri, 128))
-    else
-        sketch.add(ud.sketch, uri, 1)
-        topk.add(ud.topk, uri, 1)
-    end
+    tally_key(state.uri, uri, #uri > 128 and 128 or nil)
     if fp_key and state.fp then
-        local d = state.fp
-        sketch.add(d.sketch, fp_key, 1)
-        topk.add(d.topk, fp_key, 1)
+        tally_key(state.fp, fp_key)
     end
 end
 
@@ -804,8 +869,10 @@ local function protect_inner()
         end
     end
 
+    -- No decision means nothing for the cookie to skip. Attack mode would
+    -- otherwise read and parse Cookie on every request.
     local pass = false
-    if wants_cookie(dec) or wants_cookie(fpdec) then
+    if (dec or fpdec) and (wants_cookie(dec) or wants_cookie(fpdec)) then
         pass = verified(bin)
     end
     -- A heavy-hitter block is enforced here, not in early(), so this cookie
@@ -1010,8 +1077,8 @@ function _M.start(opts)
     shared = dict
     box = empty_box()
     box.sample = cfg.params.sample
-    allow4 = cfg.allow4
-    allow6 = cfg.allow6
+    allow4 = rule_trie(cfg.allow4)
+    allow6 = rule_trie(cfg.allow6)
     allow_paths = cfg.paths
     if #cfg.feeds > 0 then
         feeds.ensure_dir(cfg.feed_dir)
@@ -1191,7 +1258,6 @@ function _M.early()
 end
 
 function _M.status()
-    local cjson = require "cjson.safe"
     ngx.header["Content-Type"] = "application/json"
     if not started or not box then
         ngx.status = 500
@@ -1199,41 +1265,37 @@ function _M.status()
         return
     end
 
-    if ngx.req.get_method() == "POST" then
+    if ngx.req.get_method() == "POST" and state then
         local unblock = ngx.var.arg_unblock
         local blockip = ngx.var.arg_block
-        local ttl = tonumber(ngx.var.arg_ttl) or cfg.params.ttl_base
-        if unblock and unblock ~= "" then
-            local list = {}
-            local prev = box.list or {}
-            for i = 1, #prev do
-                local rec = prev[i]
-                if rec.incident == unblock then
-                    state.dict:set("supk:" .. rec.family .. ":" .. rec.key, 1, ttl)
-                else
-                    list[#list + 1] = rec
-                end
-            end
-            publish({
-                mode = box.mode, list = list,
-                rps = box.rps, mean = box.mean, sigma = box.sigma,
-            })
-            ngx.print('{"ok":true,"op":"unblock"}')
-            return
+        local ttl = tonumber(ngx.var.arg_ttl)
+        if not ttl or ttl <= 0 then
+            ttl = cfg.params.ttl_base
+        elseif ttl > 31536000 then
+            ttl = 31536000
         end
-        if blockip and blockip ~= "" then
-            local ok, err = _M._publish({
-                {
-                    cidr = blockip, action = "block", reason = "manual",
-                    message = "manual block", ttl = ttl,
-                },
-            })
-            if not ok then
+        local op, name
+        if unblock and unblock ~= "" then
+            -- An incident id, or the exact address/CIDR of a decision.
+            op, name = "u\0" .. unblock .. "\0" .. ttl, "unblock"
+        elseif blockip and blockip ~= "" then
+            local rule, err = clientip.parse_cidr(blockip)
+            if not rule then
                 ngx.status = 400
                 ngx.print(cjson.encode({ ok = false, error = err }))
                 return
             end
-            ngx.print('{"ok":true,"op":"block"}')
+            op, name = "b\0" .. blockip .. "\0" .. ttl, "block"
+        end
+        if op then
+            local ok, err = state.dict:rpush("ops", op)
+            if not ok then
+                ngx.status = 500
+                ngx.print(cjson.encode({ ok = false, error = err }))
+                return
+            end
+            -- The leader applies it on its next tick.
+            ngx.print(cjson.encode({ ok = true, op = name, applies_within = cfg.params.tick }))
             return
         end
     end
@@ -1263,6 +1325,7 @@ function _M.status()
         return
     end
 
+    local now = ngx.now()
     local view = {}
     local list = box.list or {}
     for i = 1, #list do
@@ -1271,18 +1334,26 @@ function _M.status()
             incident = r.incident,
             action = r.action,
             reason = r.reason,
+            target = r.family == "fp" and fingerprint.short(r.key)
+                or messages.label(r.key or "", r.bits),
+            uri = r.uri,
             message = r.message,
             ttl = r.ttl,
+            expires_in = r.until_ts and math.max(0, math.floor(r.until_ts - now)) or nil,
         }
+    end
+    local st = dict and cjson.decode(dict:get("stat") or "null")
+    if type(st) ~= "table" then
+        st = {}
     end
     local body = {
         mode = box.mode,
         dry_run = cfg.dry_run,
-        warming = box.warming and true or false,
-        rps = box.rps,
-        baseline_mean = box.mean,
-        baseline_sigma = box.sigma,
-        entropy = box.entropy,
+        warming = st.warming and true or false,
+        rps = st.rps,
+        baseline_mean = st.mean,
+        baseline_sigma = st.sigma,
+        entropy = st.entropy,
         version = box.ver,
         decisions = view,
         errors = err_at,
@@ -1328,23 +1399,7 @@ function _M._publish(items, mode)
         if not rule then
             return nil, err
         end
-        seq = seq + 1
-        local ttl = it.ttl or cfg.params.ttl_base
-        list[#list + 1] = {
-            family = rule.v6 and "v6" or "v4",
-            key = rule.bin,
-            bits = rule.bits,
-            action = it.action or "block",
-            reason = it.reason or "manual",
-            message = it.message or it.reason or "manual block",
-            uri = it.uri,
-            close = it.close and true or false,
-            status = it.status or 403,
-            ttl = ttl,
-            until_ts = now + ttl,
-            manual = it.manual ~= false,
-            incident = it.incident or string.format("srg-%x-%x", state.id or 0, seq),
-        }
+        list[#list + 1] = manual_record(it, rule, now)
     end
     return publish({
         mode = mode or box.mode,

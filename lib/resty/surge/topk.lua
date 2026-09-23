@@ -133,7 +133,7 @@ function _M.add_prefix(tk, full, nbytes, hash, weight, allow_new)
     end
 
     local key = sub(full, 1, nbytes)
-    local ok = _M.add(tk, key, weight)
+    local ok = _M.add(tk, key, weight, true)
     if ok then
         local slot = tk.index[key]
         if slot then
@@ -143,7 +143,8 @@ function _M.add_prefix(tk, full, nbytes, hash, weight, allow_new)
     return ok
 end
 
-function _M.add(tk, key, weight)
+-- `admit`, when given, is the caller's gate decision and replaces tk.gate.
+function _M.add(tk, key, weight, admit)
     weight = weight or 1
     if weight <= 0 then
         return false
@@ -166,7 +167,10 @@ function _M.add(tk, key, weight)
         return true
     end
 
-    if tk.gate and not tk.gate(key) then
+    if admit == nil then
+        admit = not tk.gate or tk.gate(key)
+    end
+    if not admit then
         return false
     end
 

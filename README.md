@@ -35,7 +35,9 @@ location = /_surge {
 
 `GET /_surge?format=prometheus` is the same data as text. Labels are `result` and `reason` only. Addresses are not labels.
 
-`POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident>` update the manual list.
+Each decision lists its `target` (address, CIDR, or fingerprint id) and `expires_in` seconds. Every worker answers with the same rate and baseline numbers.
+
+`POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident or address>` update the manual list. Unblock takes the incident id or the exact address or CIDR of a decision (`1.2.3.0/24` for a subnet block). Both are queued for the leader and take effect within one tick.
 
 ## Behind a CDN or load balancer
 
@@ -92,15 +94,23 @@ False positives on legitimate requests were 0, under the 0.1% target. Relaxed mo
 
 | Path | Requests/s | p50 | p99 |
 |---|---|---|---|
-| No module, `return 200` | 97398 | 323 µs | 665 µs |
-| `protect()`, normal mode | 85890 | 370 µs | 505 µs |
-| `protect()`, attack mode, allowed | 67261 | 469 µs | 791 µs |
-| Block response | 73621 | 430 µs | 633 µs |
-| `early()` handshake close | 0 completed; 100767 connect errors in 8.06s | | |
+| No module, `return 200` | 50084 | 628 µs | 1.14 ms |
+| Empty `access_by_lua`, same `content_by_lua` | 45712 | 688 µs | 1.50 ms |
+| `protect()`, normal mode | 44171 | 719 µs | 1.46 ms |
+| `protect()`, attack mode, allowed | 36849 | 843 µs | 2.04 ms |
+| Block response | 36969 | 844 µs | 1.60 ms |
+| `early()` handshake close | 0 completed; 52626 connect errors in 8s | | |
 
-The block response was not faster than a normal allow. It sends a body, and at this concurrency that costs more than the allow path. It was faster than the attack-mode allow path, which reads headers and checks the challenge cookie. `early()` never completes a request. wrk records the failures as connect errors.
+This run shared one container CPU between wrk and nginx, so it is about half the throughput of an earlier run on the same image, and requests per second moved ±10% between identical runs. Compare `protect()` with the empty `access_by_lua` row, not with `return 200`: the gap to `return 200` is mostly the Lua phases themselves. `early()` never completes a request. wrk records the failures as connect errors.
 
-A loop of 20000 `protect()` calls in normal mode allocated 15.2 KB (about 0.8 bytes per call). The same loop in attack mode allocated 932 KB, because the fingerprint is built then. `perf` is not installed in the harness image, so this run has no flame graph. `luajit -jv bench/jit_hot.lua` compiled the sketch and top-K loops. The trace log is `bench/results/jit-phase7.txt`.
+Steadier numbers come from timing `protect()` in a loop inside one request, after a 20000-call warmup (the `gc` lines of `make bench7`):
+
+| Mode | ns per call | KB allocated per 20000 calls |
+|---|---|---|
+| Normal | 105 | 9.4 |
+| Attack, allowed | 2955 | 789 |
+
+The same loop against the previous commit, five runs each with `test_hooks` on: attack mode went from 3425–4020 ns to 2830–3040 ns and from 1346–1440 KB to 98–502 KB, after hashing each key once and skipping the cookie read when there is no decision. Normal mode stayed at 215–235 ns (the `test_hooks` query-arg read is most of that). Attack mode allocates because the fingerprint is built on every request. `perf` is not installed in the harness image, so this run has no flame graph. `luajit -jv bench/jit_hot.lua` compiled the sketch and top-K loops. The trace log is `bench/results/jit-phase7.txt`.
 
 ## License
 

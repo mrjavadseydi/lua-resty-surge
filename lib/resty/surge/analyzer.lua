@@ -49,7 +49,6 @@ function _M.new(params)
         },
         shares = {},
         share_at = {},
-        seen = {},
         states = {},
         seq = 0,
         dry_run = false,
@@ -412,7 +411,6 @@ function _M.run(ctx, merged, now, previous)
     for id, seen_at in pairs(ctx.share_at) do
         if now - seen_at > idle_after and not ctx.states[id] then
             ctx.shares[id] = nil
-            ctx.seen[id] = nil
             ctx.share_at[id] = nil
         end
     end

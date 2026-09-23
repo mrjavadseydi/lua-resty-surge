@@ -134,13 +134,14 @@ local function raise(data, idx, limit)
     end
 end
 
-function _M.add(sk, key, weight, nbytes)
+-- Returns the estimate after the add. Under conservative update that is
+-- the new row minimum, so a caller can gate on it without a second query.
+function _M.add_hashed(sk, h1, h2, weight)
     weight = weight or 1
     if weight <= 0 then
-        return
+        return min4(sk.cur, buckets(sk, h1, h2))
     end
 
-    local h1, h2 = hash_pair(key, nbytes)
     local i0, i1, i2, i3 = buckets(sk, h1, h2)
     local data = sk.cur
     local est = min4(data, i0, i1, i2, i3)
@@ -153,6 +154,12 @@ function _M.add(sk, key, weight, nbytes)
     raise(data, i2, limit)
     raise(data, i3, limit)
     sk.total = sk.total + weight
+    return limit
+end
+
+function _M.add(sk, key, weight, nbytes)
+    local h1, h2 = hash_pair(key, nbytes)
+    return _M.add_hashed(sk, h1, h2, weight)
 end
 
 function _M.query(sk, key, nbytes)

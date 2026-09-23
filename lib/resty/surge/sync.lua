@@ -104,10 +104,11 @@ function _M.decode_topk(blob)
     return items, scale, total * scale
 end
 
-local function flush_one(dict, key, tk, scale, total)
+local function flush_one(dict, key, tk, scale, total, ttl)
     local blob = _M.encode_topk(tk, scale, total)
-    -- safe_set does not evict someone else's decision to make room.
-    local ok, err = dict:safe_set(key, blob)
+    -- safe_set does not evict someone else's decision to make room. The TTL
+    -- drops a stuck worker's last window instead of merging it every tick.
+    local ok, err = dict:safe_set(key, blob, ttl)
     if not ok then
         return err
     end
@@ -193,7 +194,7 @@ function _M.tick(state)
         if d.sketch_total then
             total = d.sketch_total(d.sketch) or 0
         end
-        local err = flush_one(dict, d.slot, d.topk, scale, total)
+        local err = flush_one(dict, d.slot, d.topk, scale, total, state.tick * 4)
         if err then
             ngx.log(ngx.ERR, "surge: flush ", d.slot, " failed: ", err)
         end

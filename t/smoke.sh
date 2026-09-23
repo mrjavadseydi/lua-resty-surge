@@ -144,6 +144,30 @@ if [ "$code" != "200" ]; then
     fail "unblock did not clear the block ($code)" "$PREFIX"
 fi
 
+# Every worker reports the leader's numbers, not nulls.
+i=0
+while [ "$i" -lt 10 ]; do
+    s=$(curl -sf "http://127.0.0.1:$PORT/_surge") || fail "status" "$PREFIX"
+    echo "$s" | grep -q '"rps":[0-9]' || fail "status without rps: $s" "$PREFIX"
+    i=$((i + 1))
+done
+
+# Block and unblock by address. Both go through the leader's queue.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/_surge?block=bad")
+[ "$code" = "400" ] || fail "bad cidr was accepted ($code)" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.1&ttl=60" | grep -q '"op":"block"' \
+    || fail "block by address" "$PREFIX"
+sleep 0.8
+s=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+echo "$s" | grep -q '"target":"127.0.0.1"' || fail "status target: $s" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
+[ "$code" = "403" ] || fail "block by address did not apply ($code)" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" | grep -q unblock \
+    || fail "unblock by address" "$PREFIX"
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
+[ "$code" = "200" ] || fail "unblock by address did not clear ($code)" "$PREFIX"
+
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6
 grep -q "internal error" "$PREFIX/logs/error.log" || fail "fail-open was not logged" "$PREFIX"

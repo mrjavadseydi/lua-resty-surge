@@ -58,6 +58,15 @@ describe("count-min sketch", function()
         assert(sketch.query(sk, "x") == 4294967295, "wrapped")
     end)
 
+    it("returns the post-add estimate that query would give", function()
+        local sk = sketch.new(64, 4)
+        for i = 1, 5000 do
+            local key = "k" .. (i % 300)
+            local est = sketch.add(sk, key, 1)
+            assert(est == sketch.query(sk, key), "add/query mismatch at " .. i)
+        end
+    end)
+
     it("rotates by filling the spare buffer", function()
         local sk = sketch.new(16, 4)
         sketch.add(sk, "x", 5)
