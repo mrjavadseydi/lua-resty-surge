@@ -101,7 +101,7 @@ function _M.build(list)
     local v6 = node()
     for i = 1, #list do
         local rec = list[i]
-        if rec.family ~= "fp" then
+        if rec.family == "v4" or rec.family == "v6" then
             local root = rec.family == "v6" and v6 or v4
             _M.insert(root, rec.key, rec.bits, rec)
         end
@@ -160,6 +160,8 @@ local function rstr(s, i)
     return sub(s, j, j + n - 1), j + n
 end
 
+local FAMILY = { [6] = "v6", [16] = "fp", [32] = "host" }
+
 function _M.encode(snap)
     local list = snap.list or {}
     local parts = { wstr(snap.mode or "normal"), u16(#list) }
@@ -170,6 +172,8 @@ function _M.encode(snap)
             fam = 6
         elseif r.family == "fp" then
             fam = 16
+        elseif r.family == "host" then
+            fam = 32
         end
         parts[#parts + 1] = char(fam)
         parts[#parts + 1] = char(r.bits or 0)
@@ -249,7 +253,7 @@ function _M.decode(blob)
             return nil, "truncated tail"
         end
         list[k] = {
-            family = fam == 6 and "v6" or (fam == 16 and "fp" or "v4"),
+            family = FAMILY[fam] or "v4",
             bits = bits,
             key = key,
             action = action,

@@ -7,6 +7,8 @@
 -- a one-tick spike of a brand new key does not escalate.
 -- URIs are never decisions. When one URI is most of the window, IP and
 -- subnet decisions are scoped to that path.
+-- A host (site) offends when the mode is up and its share rose by
+-- host_share_rise over its baseline. Host decisions stop at challenge.
 
 local exp = math.exp
 local baseline = require "resty.surge.baseline"
@@ -22,6 +24,7 @@ local BLOCK_DIMS = {
     s4 = { family = "v4", bits = 24 },
     s6 = { family = "v6", bits = 64 },
     f = { family = "fp" },
+    h = { family = "host" },
 }
 
 local function tracker(params)
@@ -187,6 +190,9 @@ function _M.run(ctx, merged, now, previous)
         if rec.family == "fp" then
             return "f"
         end
+        if rec.family == "host" then
+            return "h"
+        end
         if rec.bits == 24 then
             return "s4"
         end
@@ -246,23 +252,33 @@ function _M.run(ctx, merged, now, previous)
         if action == "observe" and (st.streak or 0) == 0 then
             return
         end
+        local is_host = meta.family == "host"
+        local label = key
+        if meta.family == "fp" then
+            label = fingerprint.short(key)
+        elseif not is_host then
+            label = messages.label(key, meta.bits)
+        end
+        -- The limit stage caps a site at about twice its normal traffic,
+        -- not at the per-client limit_rps.
+        local limit = p.limit_rps
+        if is_host then
+            limit = math.max(p.min_rps, (base or 0) * (ctx.baseline.mean or 0) * 2)
+        end
         local rec = {
             family = meta.family,
             key = key,
             bits = meta.bits,
             action = action,
             reason = reason,
-            message = messages.line(action,
-                meta.family == "fp" and fingerprint.short(key)
-                    or messages.label(key, meta.bits),
-                share, base or 0, rate, p.tick),
-            uri = uri_scope,
+            message = messages.line(action, label, share, base or 0, rate, p.tick),
+            uri = not is_host and uri_scope or nil,
             close = false,
             status = (action == "limit" or action == "challenge") and 429 or 403,
             ttl = st.ttl > 0 and st.ttl or p.ttl_base,
             until_ts = st.until_ts,
             incident = st.incident,
-            rate = p.limit_rps,
+            rate = limit,
             share = share,
             confidence = st.confidence,
         }
@@ -335,6 +351,33 @@ function _M.run(ctx, merged, now, previous)
 
             if manual_ids[id] then
                 -- operator block wins over a fresh automatic one
+            elseif dim == "h" then
+                -- Absolute rise, not a multiple: 1% -> 30% and 40% -> 70% both
+                -- count. A host first seen during a surge is judged against 0.
+                local rise = p.host_share_rise or 0.25
+                if not warming and mode ~= "normal" and rate > p.min_key_rps
+                    and share - (base or 0) >= rise
+                then
+                    if not st then
+                        ctx.seq = ctx.seq + 1
+                        st = escalation.new(string.format("srg-%x", ctx.seq))
+                        ctx.states[id] = st
+                    end
+                    if st.stage ~= "observe" and st.until_ts and now >= st.until_ts then
+                        st.stage = "observe"
+                        st.streak = 0
+                        st.ttl = 0
+                    end
+                    -- Confidence is how much of the node this one site just
+                    -- took over. Past confidence_skip each stage takes a tick.
+                    local conf = math.min(1, share - (base or 0))
+                    local cap = ctx.dry_run and "observe" or "challenge"
+                    escalation.step(st, true, conf, p, now, cap)
+                    emit(id, st, key, meta, share, base, rate, "host_surge")
+                elseif st then
+                    escalation.step(st, false, 0, p, now, nil)
+                    hold(id, st)
+                end
             elseif hard_only and dim == "i4" and p.hard_ip_rps
                 and rate > p.hard_ip_rps
             then
@@ -388,6 +431,7 @@ function _M.run(ctx, merged, now, previous)
     consider("s4", BLOCK_DIMS.s4, warming)
     consider("s6", BLOCK_DIMS.s6, warming)
     consider("f", BLOCK_DIMS.f, warming)
+    consider("h", BLOCK_DIMS.h, warming)
 
     -- Keys we blocked are absent from the top-K. Step them anyway so the
     -- TTL can expire them back to observe, and keep publishing until then.

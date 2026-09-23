@@ -76,14 +76,20 @@ local function has_prefix(s, p)
     return true
 end
 
+-- Samples per worker per tick the analyzer needs. Above that, counting
+-- more requests costs CPU without changing a share, so the sampling
+-- interval grows with load: a 10x bigger flood is not a 10x bigger bill.
+local SAMPLE_TARGET = 512
+local load_sample = 1
+
 local function sample_of(mode)
+    local floor = cfg.params.sample
     if mode == "attack" then
-        return 1
+        floor = 1
+    elseif mode == "elevated" then
+        floor = 4
     end
-    if mode == "elevated" then
-        return 4
-    end
-    return cfg.params.sample
+    return load_sample > floor and load_sample or floor
 end
 
 local function note_error(err)
@@ -103,20 +109,23 @@ local function empty_box()
         count = 0,
         fp = {},
         fp_n = 0,
+        hosts = {},
+        host_n = 0,
+        chal_n = 0,
     }
 end
 
-local function index_fp(list)
-    local fp = {}
+local function index_family(list, family)
+    local out = {}
     local n = 0
     for i = 1, #list do
         local r = list[i]
-        if r.family == "fp" then
-            fp[r.key] = r
+        if r.family == family then
+            out[r.key] = r
             n = n + 1
         end
     end
-    return fp, n
+    return out, n
 end
 
 local function install(snap)
@@ -141,7 +150,15 @@ local function install(snap)
     box.mean = snap.mean
     box.sigma = snap.sigma
     box.entropy = snap.entropy
-    box.fp, box.fp_n = index_fp(snap.list)
+    box.fp, box.fp_n = index_family(snap.list, "fp")
+    box.hosts, box.host_n = index_family(snap.list, "host")
+    local chal_n = 0
+    for i = 1, #snap.list do
+        if snap.list[i].action == "challenge" then
+            chal_n = chal_n + 1
+        end
+    end
+    box.chal_n = chal_n
 end
 
 local function dim(slot, suffix, sk, tk)
@@ -166,6 +183,7 @@ local function make_state(dict, id)
     local sk_sub6 = sketch.new(w, 4)
     local sk_uri = sketch.new(w, 4)
     local sk_fp = sketch.new(w, 4)
+    local sk_host = sketch.new(w, 4)
     local k = p.topk
     state = {
         dict = dict,
@@ -183,6 +201,7 @@ local function make_state(dict, id)
             dim(prefix .. "s6", "s6", sk_sub6, topk.new(k)),
             dim(prefix .. "u", "u", sk_uri, topk.new(k)),
             dim(prefix .. "f", "f", sk_fp, topk.new(k)),
+            dim(prefix .. "h", "h", sk_host, topk.new(k)),
         },
     }
     -- Named handles for the request path. The dims array is what the timer walks.
@@ -190,6 +209,7 @@ local function make_state(dict, id)
     state.sub4, state.sub6 = state.dims[3], state.dims[4]
     state.uri = state.dims[5]
     state.fp = state.dims[6]
+    state.host = state.dims[7]
     state.analyze = on_merged
 end
 
@@ -469,6 +489,22 @@ local function same_net(r, rule)
     return clientip.matches(rule, key)
 end
 
+-- A worker reports an address that keeps getting the challenge page
+-- without solving it. The op carries it as hex because the op format is
+-- split on NUL. IPv6 is blocked as its /64.
+local function ignored_rule(hex)
+    if not hex or (#hex ~= 8 and #hex ~= 32) or hex:find("[^%x]") then
+        return nil
+    end
+    local bin = hex:gsub("%x%x", function(h)
+        return string.char(tonumber(h, 16))
+    end)
+    if #bin == 16 then
+        return { bin = bin:sub(1, 8) .. string.rep("\0", 8), bits = 64, v6 = true }
+    end
+    return { bin = bin, bits = 32, v6 = false }
+end
+
 -- status() queues block/unblock here instead of publishing from whatever
 -- worker served it. A worker's list can be a tick stale, and publishing it
 -- would drop a live block the leader then forgets. The leader is the only
@@ -477,15 +513,47 @@ local function apply_ops(now)
     local dict = state.dict
     local list = box.list or {}
     local changed = false
-    for _ = 1, 256 do
+    local blocked
+    -- ponytail: every challenge_ignored block rides in the one decision blob
+    -- (~150 B each). Past tens of thousands, give them their own blob.
+    for _ = 1, 4096 do
         local op = dict:lpop("ops")
         if not op then
             break
         end
         local kind, arg, ttl_s = op:match("^(%a)%z(.-)%z(.*)$")
         local ttl = tonumber(ttl_s) or cfg.params.ttl_base
-        local rule = arg and clientip.parse_cidr(arg)
-        if kind == "b" and rule then
+        local rule
+        if kind == "c" then
+            rule = ignored_rule(arg)
+        else
+            rule = arg and clientip.parse_cidr(arg)
+        end
+        if kind == "c" and rule then
+            -- Several workers can report the same address in one window.
+            if not blocked then
+                blocked = {}
+                for i = 1, #list do
+                    local r = list[i]
+                    if r.action == "block" and r.key then
+                        blocked[r.key .. "/" .. (r.bits or 0)] = true
+                    end
+                end
+            end
+            local id = rule.bin .. "/" .. rule.bits
+            if not blocked[id] then
+                blocked[id] = true
+                -- close: a bot gets no body and no headers, just a closed socket.
+                list[#list + 1] = manual_record({
+                    ttl = ttl,
+                    close = true,
+                    reason = "challenge_ignored",
+                    message = "Blocked " .. messages.label(rule.bin, rule.bits)
+                        .. ": ignored the challenge page",
+                }, rule, now)
+                changed = true
+            end
+        elseif kind == "b" and rule then
             list[#list + 1] = manual_record({ ttl = ttl }, rule, now)
             changed = true
         elseif kind == "u" then
@@ -650,6 +718,10 @@ local function observe(family, bin, fp_key)
     if fp_key and state.fp then
         tally_key(state.fp, fp_key)
     end
+    local host = ngx.var.host
+    if host and host ~= "" then
+        tally_key(state.host, host, #host > 128 and 128 or nil)
+    end
 end
 
 local function due_sample()
@@ -680,13 +752,56 @@ end
 
 local cookie_checked, cookie_pass
 
+-- Verified cookie value -> the address it was last verified from. A viewer
+-- sends the same cookie on every request; one HMAC per worker per 30s
+-- instead of one per request. A different address re-verifies, because the
+-- cookie is bound to a /24 or /64.
+-- ponytail: 30s cache ttl, so a cookie can outlive its expiry by up to 30s.
+local pass_cache = require("resty.lrucache").new(20000)
+local PASS_TTL = 30
+
+-- Decisions a solved challenge cookie lets a browser through. A site-wide
+-- challenge, manual or not, exists to be solved.
+local function skippable(dec)
+    if dec.family == "host" then
+        return true
+    end
+    return not dec.manual and dec.reason == "heavy_hitter"
+end
+
+-- Count unsolved challenge pages per address across workers. At
+-- chal_ignore pages in 10s the address is queued for a block, which
+-- early() and the nftables export then pick up.
+local function note_page(bin)
+    local limit = cfg.params.chal_ignore
+    if not shared or not limit or limit <= 0 then
+        return
+    end
+    local n = shared:incr("cf:" .. bin, 1, 0, 10)
+    if n == limit then
+        shared:rpush("ops", "c\0" .. sha.hex(bin) .. "\0" .. cfg.params.ttl_base)
+    end
+end
+
 local function verified(bin)
     if cookie_checked then
         return cookie_pass
     end
     cookie_checked = true
-    cookie_pass = challenge.valid(ngx.var.http_cookie, bin, ngx.now(),
+    cookie_pass = false
+    local value = challenge.find(ngx.var.http_cookie)
+    if not value then
+        return false
+    end
+    if pass_cache:get(value) == bin then
+        cookie_pass = true
+        return true
+    end
+    cookie_pass = challenge.valid_value(value, bin, ngx.now(),
         secret_cur, secret_prev, secret_ver, secret_prev_ver)
+    if cookie_pass then
+        pass_cache:set(value, bin, PASS_TTL)
+    end
     return cookie_pass
 end
 
@@ -694,7 +809,7 @@ local function wants_cookie(dec)
     if box.mode == "attack" then
         return true
     end
-    return dec and not dec.manual and dec.reason == "heavy_hitter"
+    return dec and skippable(dec)
         and (dec.action == "block" or dec.action == "challenge"
             or dec.action == "limit" or dec.close)
 end
@@ -758,7 +873,7 @@ local function apply_dec(dec, bin, pass)
         end
         return nil
     end
-    if pass and not dec.manual and dec.reason == "heavy_hitter" then
+    if pass and skippable(dec) then
         return nil
     end
     if dec.action == "block" or dec.close then
@@ -766,6 +881,10 @@ local function apply_dec(dec, bin, pass)
     end
     if dec.action == "challenge" then
         if api_request() then
+            -- A whole site cannot 403 its API. Hold it to the site rate.
+            if dec.family == "host" then
+                return limit_denied(dec)
+            end
             return dec, 403
         end
         local baked = try_pow(bin)
@@ -781,6 +900,7 @@ local function apply_dec(dec, bin, pass)
         if not html then
             return nil
         end
+        note_page(bin)
         return "page", html
     end
     if dec.action == "limit" then
@@ -831,6 +951,10 @@ local function protect_inner()
     if allowed_ip(family, bin) or allowed_path() or ipdb.hit(good, bin) then
         return nil
     end
+    -- The uri is read only while some challenge is live.
+    if box.chal_n > 0 and ngx.var.uri == challenge.SCRIPT_PATH then
+        return "script"
+    end
 
     local trie = family == "v6" and box.trie6 or box.trie4
     local dec = decisions.lookup(trie, bin, accept_dec)
@@ -852,9 +976,9 @@ local function protect_inner()
     local want_fp = false
     if cfg.test_hooks and ngx.var.arg_surge_fp == "1" then
         want_fp = true
-    elseif box.mode == "attack"
-        or (box.mode == "elevated" and ((box.fp_n or 0) > 0 or due_sample()))
-    then
+    elseif box.mode ~= "normal" and ((box.fp_n or 0) > 0 or due_sample()) then
+        -- A live fingerprint decision needs every request. Otherwise only
+        -- the sampled ones are counted, so only those are built.
         want_fp = true
     end
     local fp_key
@@ -869,10 +993,18 @@ local function protect_inner()
         end
     end
 
+    -- Host is read only while some site has a decision.
+    local hostdec
+    if box.host_n > 0 then
+        hostdec = box.hosts[ngx.var.host or ""]
+    end
+
     -- No decision means nothing for the cookie to skip. Attack mode would
     -- otherwise read and parse Cookie on every request.
     local pass = false
-    if (dec or fpdec) and (wants_cookie(dec) or wants_cookie(fpdec)) then
+    if (dec or fpdec or hostdec)
+        and (wants_cookie(dec) or wants_cookie(fpdec) or wants_cookie(hostdec))
+    then
         pass = verified(bin)
     end
     -- A heavy-hitter block is enforced here, not in early(), so this cookie
@@ -882,6 +1014,10 @@ local function protect_inner()
         return out, extra
     end
     out, extra = apply_dec(fpdec, bin, pass)
+    if out then
+        return out, extra
+    end
+    out, extra = apply_dec(hostdec, bin, pass)
     if out then
         return out, extra
     end
@@ -1033,10 +1169,17 @@ local function on_tick(premature)
     end
     maybe_reload_feeds()
     load_secrets()
+    -- Requests that reached observe() this tick, before flush clears them.
+    local seen = stats_allowed
     flush_stats()
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
+    end
+    -- After the flush, so the window just sent was counted at one interval.
+    load_sample = math.floor(seen / SAMPLE_TARGET)
+    if box then
+        box.sample = sample_of(box.mode)
     end
     if err_n > 0 then
         ngx.log(ngx.ERR, "surge: ", err_n, " internal error(s) this tick: ",
@@ -1157,6 +1300,14 @@ function _M.protect()
         ngx.header["Cache-Control"] = "no-store"
         ngx.print(status or "")
         return ngx.exit(403)
+    end
+    if dec == "script" then
+        tally("allowed")
+        ngx.header["Content-Type"] = "application/javascript"
+        ngx.header["Cache-Control"] = "public, max-age=86400"
+        ngx.header["Content-Length"] = #challenge.SCRIPT
+        ngx.print(challenge.SCRIPT)
+        return ngx.exit(200)
     end
     if dec == "solved" then
         tally("allowed")
@@ -1334,7 +1485,8 @@ function _M.status()
             incident = r.incident,
             action = r.action,
             reason = r.reason,
-            target = r.family == "fp" and fingerprint.short(r.key)
+            target = (r.family == "fp" and fingerprint.short(r.key))
+                or (r.family == "host" and r.key)
                 or messages.label(r.key or "", r.bits),
             uri = r.uri,
             message = r.message,
@@ -1395,11 +1547,17 @@ function _M._publish(items, mode)
     local now = ngx.now()
     for i = 1, #items do
         local it = items[i]
-        local rule, err = clientip.parse_cidr(it.cidr)
-        if not rule then
-            return nil, err
+        if it.host then
+            local rec = manual_record(it, { bin = it.host, bits = 0 }, now)
+            rec.family = "host"
+            list[#list + 1] = rec
+        else
+            local rule, err = clientip.parse_cidr(it.cidr)
+            if not rule then
+                return nil, err
+            end
+            list[#list + 1] = manual_record(it, rule, now)
         end
-        list[#list + 1] = manual_record(it, rule, now)
     end
     return publish({
         mode = mode or box.mode,

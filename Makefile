@@ -7,7 +7,7 @@ IMAGE ?= lua-resty-surge/harness:latest
 OPENRESTY_IMAGE ?= openresty/openresty:1.31.1.1-3-jammy
 RUN := docker run --rm -v $(CURDIR):/work -w /work $(IMAGE)
 
-.PHONY: image image-if-missing test test-unit smoke feeds phase6 sim bench bench7 microbench radix shell version
+.PHONY: image image-if-missing test test-unit smoke feeds phase6 sim bench bench7 bench-cost microbench radix shell version
 
 image:
 	docker build -t $(IMAGE) --build-arg OPENRESTY_IMAGE=$(OPENRESTY_IMAGE) -f docker/Dockerfile.test docker
@@ -36,6 +36,9 @@ sim: | image-if-missing
 
 bench7: | image-if-missing
 	$(RUN) sh bench/phase7.sh
+
+bench-cost: | image-if-missing
+	$(RUN) sh bench/cost.sh
 
 bench: | image-if-missing
 	$(RUN) sh bench/protect.sh

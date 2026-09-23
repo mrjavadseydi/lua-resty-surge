@@ -62,6 +62,10 @@ M.relaxed = preset({
     test_hooks = false,
     -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
     feed_poll = 30,
+    -- A site whose share of traffic rises this much (absolute) during a surge is challenged.
+    host_share_rise = 0.35,
+    -- Unsolved challenge pages one address may get in 10s before it is blocked.
+    chal_ignore = 20,
 })
 
 M.balanced = preset({
@@ -97,6 +101,8 @@ M.balanced = preset({
     test_hooks = false,
     -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
     feed_poll = 30,
+    host_share_rise = 0.25,
+    chal_ignore = 10,
 })
 
 M.strict = preset({
@@ -132,6 +138,8 @@ M.strict = preset({
     test_hooks = false,
     -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.
     feed_poll = 30,
+    host_share_rise = 0.15,
+    chal_ignore = 6,
 })
 
 function M.copy(name)

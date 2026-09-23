@@ -85,24 +85,37 @@ local function unhex(s)
     return table.concat(out)
 end
 
+-- Plain find, no pattern walk over every cookie. The name must start the
+-- header or follow "; " so "xsrg_pow=" does not match.
+local NEEDLE = _M.NAME .. "="
 function _M.find(header)
     if type(header) ~= "string" then
         return nil
     end
-    local name = _M.NAME
-    for part in header:gmatch("[^;]+") do
-        local k, v = part:match("^%s*([^=%s]+)%s*=%s*(.-)%s*$")
-        if k == name and v and v ~= "" then
-            return v
+    local from = 1
+    while true do
+        local i, j = string.find(header, NEEDLE, from, true)
+        if not i then
+            return nil
         end
+        local before = i > 1 and string.byte(header, i - 1) or 59
+        if before == 59 or before == 32 or before == 9 then
+            local v = string.match(header, "^[^;%s]+", j + 1)
+            if v then
+                return v
+            end
+        end
+        from = j + 1
     end
-    return nil
 end
 
 -- cur_ver selects cur. prev_ver selects prev. Any other version is rejected
 -- without a second HMAC.
 function _M.valid(header, bin, now, cur, prev, cur_ver, prev_ver)
-    local value = _M.find(header)
+    return _M.valid_value(_M.find(header), bin, now, cur, prev, cur_ver, prev_ver)
+end
+
+function _M.valid_value(value, bin, now, cur, prev, cur_ver, prev_ver)
     if not value then
         return false
     end
@@ -146,16 +159,16 @@ function _M.cookie_header(value, ttl, secure)
     return line
 end
 
--- Inline SHA-256. No external script, and it matches the Lua digest on
--- ASCII (the token and the decimal nonce).
-local PAGE = [[<!doctype html><meta charset=utf-8><title>Checking your browser</title>
-<p>Checking your browser.</p>
-<script>
-(function(){
-var ch=%q;
-var bits=%d;
-var ret=%q;
-var method=%q;
+-- The page is a few hundred bytes: the token, the return path, and a
+-- script tag. The proof-of-work script is one static file the browser
+-- caches, served from SCRIPT_PATH while any challenge is live. A bot that
+-- never runs JavaScript never downloads it. The script's SHA-256 matches
+-- the Lua digest on ASCII (the token and the decimal nonce).
+_M.SCRIPT_PATH = "/.srg-pow.v1.js"
+
+_M.SCRIPT = [[(function(){
+var d=window.srg||[];
+var ch=d[0],bits=d[1],ret=d[2],method=d[3];
 var K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
 function rr(n,x){return (x>>>n)|(x<<(32-n));}
 function add(a,b){return (a+b)>>>0;}
@@ -165,7 +178,7 @@ function sha256(msg){
   for(var i=0;i<msg.length;i++) bytes.push(msg.charCodeAt(i)&255);
   var bitLen=bytes.length*8;
   bytes.push(128);
-  while((bytes.length%%64)!==56) bytes.push(0);
+  while((bytes.length%64)!==56) bytes.push(0);
   var hi=Math.floor(bitLen/4294967296), lo=bitLen>>>0;
   bytes.push((hi>>>24)&255,(hi>>>16)&255,(hi>>>8)&255,hi&255,(lo>>>24)&255,(lo>>>16)&255,(lo>>>8)&255,lo&255);
   var w=new Array(64);
@@ -225,7 +238,12 @@ function step(){
 }
 step();
 })();
-</script>
+]]
+
+local PAGE = [[<!doctype html><meta charset=utf-8><title>Checking your browser</title>
+<p>Checking your browser.</p>
+<script>var srg=[%q,%d,%q,%q];</script>
+<script src="]] .. _M.SCRIPT_PATH .. [["></script>
 ]]
 
 -- request_uri keeps the raw path and query. A value that is not a

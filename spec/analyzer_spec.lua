@@ -92,7 +92,76 @@ local function reach_block(ctx, now)
     return snap, now
 end
 
+-- Twenty sites share the node. victim.io is 1% of normal traffic.
+local function sites(victim_count)
+    local h = {}
+    local total = 0
+    for i = 1, 19 do
+        local name = "site" .. i .. ".io"
+        local n = i == 1 and 400 or 30
+        h[name] = { key = name, count = n, error = 0 }
+        total = total + n
+    end
+    h["victim.io"] = { key = "victim.io", count = victim_count, error = 0 }
+    total = total + victim_count
+    -- A spread botnet: no ip or subnet is heavy, so i4 carries only the total.
+    return {
+        i4 = { [nat] = { key = nat, count = 30, error = 0 } },
+        i6 = {}, s4 = {}, s6 = {},
+        u = { ["/"] = { key = "/", count = total, error = 0 } },
+        h = h,
+        _totals = { i4 = total, i6 = 0, s4 = 0, s6 = 0, u = total, h = total },
+    }
+end
+
 describe("analyzer", function()
+    it("challenges the flooded site, never blocks it, and leaves the others", function()
+        local ctx = analyzer.new(params())
+        local now = 0
+        for _ = 1, 80 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, sites(10), now, nil)
+            assert(#snap.list == 0)
+        end
+        local seen = {}
+        local snap
+        for _ = 1, 12 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, sites(8000), now, snap and snap.list)
+            assert(snap.mode ~= "normal")
+            local rec = find(snap.list, "victim.io")
+            if rec then
+                seen[rec.action] = true
+                assert(rec.family == "host")
+                assert(rec.reason == "host_surge")
+                assert(rec.uri == nil)
+                assert(rec.message:find("victim.io", 1, true))
+                assert(rec.rate >= 20)
+            end
+            assert(find(snap.list, "site1.io") == nil)
+            assert(find(snap.list, "site2.io") == nil)
+        end
+        assert(seen.limit, "no limit stage")
+        assert(seen.challenge, "no challenge stage")
+        assert(not seen.block, "a whole site was blocked")
+    end)
+
+    it("keeps a host decision at observe in dry run", function()
+        local ctx = analyzer.new(params())
+        ctx.dry_run = true
+        local now = 0
+        for _ = 1, 80 do
+            now = now + 0.25
+            analyzer.run(ctx, sites(10), now, nil)
+        end
+        for _ = 1, 8 do
+            now = now + 0.25
+            local snap = analyzer.run(ctx, sites(8000), now, nil)
+            local rec = find(snap.list, "victim.io")
+            assert(not rec or rec.action == "observe")
+        end
+    end)
+
     it("blocks a flood and leaves a steady NAT alone", function()
         local ctx = analyzer.new(params())
         local now = 0

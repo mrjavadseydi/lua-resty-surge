@@ -19,7 +19,9 @@ write_conf() {
     prefix=$1
     port=$2
     dry=$3
-    mkdir -p "$prefix/logs" "$prefix/conf"
+    mkdir -p "$prefix/logs" "$prefix/conf" "$prefix/export"
+    # Workers run as nobody; they write the export.
+    chmod 777 "$prefix/export"
     cat > "$prefix/conf/nginx.conf" <<EOF
 worker_processes 2;
 error_log logs/error.log info;
@@ -38,6 +40,7 @@ http {
             allow = { "/health" },
             dry_run = $dry,
             advanced = { test_hooks = true, tick = 0.25 },
+            export_path = "$prefix/export/blocks.txt",
         })
     }
 
@@ -53,6 +56,16 @@ http {
                 local ok, err = require("resty.surge")._publish({
                     { cidr = "127.0.0.1/32", action = "block",
                       reason = "manual", message = "manual block" },
+                })
+                ngx.say(ok and "published" or err)
+            }
+        }
+
+        location = /_host {
+            content_by_lua_block {
+                local ok, err = require("resty.surge")._publish({
+                    { host = "victim.test", action = "challenge",
+                      reason = "host_surge", message = "site challenge" },
                 })
                 ngx.say(ok and "published" or err)
             }
@@ -171,6 +184,36 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6
 grep -q "internal error" "$PREFIX/logs/error.log" || fail "fail-open was not logged" "$PREFIX"
+
+# A site-wide challenge: other sites pass, the API is rate-held instead of
+# 403, and an address that keeps ignoring the page is blocked and exported.
+# Last in this block because it ends with 127.0.0.1 blocked.
+curl -sf "http://127.0.0.1:$PORT/_host" | grep -q published || fail "host publish" "$PREFIX"
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/")
+[ "$code" = "200" ] || fail "other site was denied ($code)" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
+    -H 'Accept: application/json' "http://127.0.0.1:$PORT/api")
+[ "$code" = "200" ] || fail "api under a site challenge was denied ($code)" "$PREFIX"
+page=$(curl -s -H 'Host: victim.test' "http://127.0.0.1:$PORT/")
+echo "$page" | grep -q '/.srg-pow.v1.js' || fail "no challenge page: $page" "$PREFIX"
+[ "$(printf %s "$page" | wc -c)" -lt 400 ] || fail "challenge page is too big" "$PREFIX"
+# The script is one cached static file, served only while a challenge is live.
+js=$(curl -sS -D - -H 'Host: victim.test' "http://127.0.0.1:$PORT/.srg-pow.v1.js")
+echo "$js" | grep -qi "Cache-Control: public" || fail "script not cacheable: $js" "$PREFIX"
+echo "$js" | grep -q "window.srg" || fail "script body: $js" "$PREFIX"
+i=1
+while [ "$i" -lt 10 ]; do
+    curl -s -o /dev/null -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
+    i=$((i + 1))
+done
+sleep 0.8
+# A bot that ignored the page gets a closed socket (444), not a body.
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/" || true)
+[ "$code" = "000" ] || fail "ignored challenge not closed ($code)" "$PREFIX"
+curl -sf "http://127.0.0.1:$PORT/_surge" | grep -q '"reason":"challenge_ignored"' \
+    || fail "block reason missing from status" "$PREFIX"
+grep -q "^v4 32 127.0.0.1 " "$PREFIX/export/blocks.txt" || fail "block not exported" "$PREFIX"
 
 echo "block path ok"
 

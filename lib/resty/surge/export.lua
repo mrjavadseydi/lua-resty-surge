@@ -34,7 +34,8 @@ function _M.lines(list, now, min_confidence)
     local floor_c = min_confidence or 0.9
     for i = 1, #(list or {}) do
         local r = list[i]
-        if r.action == "block" and not r.uri then
+        local ip = r.family == "v4" or r.family == "v6"
+        if ip and r.action == "block" and not r.uri then
             local conf = r.confidence or (r.manual and 1 or 0)
             if r.manual or conf >= floor_c then
                 local addr = r.family == "v6" and ipv6(r.key) or ipv4(r.key)

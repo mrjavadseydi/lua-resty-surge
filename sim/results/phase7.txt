@@ -6,6 +6,7 @@ botnet on /login             detect 0.50s    block 5.00s    fp 0.0000% (0/2000) 
 random-path cache bust       detect 0.50s    block 4.50s    fp 0.0000% (0/2000) fn 5.0000% collateral 0  v4 
 slow ramp 2%/min             detect none     block none     fp 0.0000% (0/840100) fn 0.0000% collateral 0  detect at 0.00x, block at none
 attack during legit spike    detect 0.50s    block 7.50s    fp 0.0000% (0/30000) fn 6.6667% collateral 0  v4 mode attack
+botnet on 1 of 20 sites      detect 0.50s    block 1.00s    fp 0.0000% (0/1980) fn 0.0000% collateral 0  host challenge; victim.io legit challenged 20/20
 
 == balanced ==
 legit baseline               detect none     block none     fp 0.0000% (0/6000) fn 0.0000% collateral 0  mode normal
@@ -15,6 +16,7 @@ botnet on /login             detect 0.25s    block 1.00s    fp 0.0000% (0/2000) 
 random-path cache bust       detect 0.25s    block 0.75s    fp 0.0000% (0/2000) fn 0.0000% collateral 0  v4 
 slow ramp 2%/min             detect 30.25s   block 319.00s  fp 0.0000% (0/69850) fn 81.3665% collateral 0  v4 detect at 1.01x, block at 1.11x
 attack during legit spike    detect 0.25s    block 0.75s    fp 0.0000% (0/30000) fn 0.0000% collateral 0  v4 mode attack
+botnet on 1 of 20 sites      detect 0.25s    block 0.50s    fp 0.0000% (0/1980) fn 0.0000% collateral 0  host challenge; victim.io legit challenged 20/20
 
 == strict ==
 legit baseline               detect none     block none     fp 0.0000% (0/6000) fn 0.0000% collateral 0  mode normal
@@ -24,3 +26,4 @@ botnet on /login             detect 0.25s    block 1.00s    fp 0.0000% (0/2000) 
 random-path cache bust       detect 0.25s    block 0.75s    fp 0.0000% (0/2000) fn 0.0000% collateral 0  v4 
 slow ramp 2%/min             detect 30.25s   block 149.25s  fp 0.0000% (0/35900) fn 65.1613% collateral 0  v4 detect at 1.01x, block at 1.05x
 attack during legit spike    detect 0.25s    block 0.75s    fp 0.0000% (0/30000) fn 0.0000% collateral 0  v4 mode attack
+botnet on 1 of 20 sites      detect 0.25s    block 0.50s    fp 0.0000% (0/1980) fn 0.0000% collateral 0  host challenge; victim.io legit challenged 20/20

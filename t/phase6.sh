@@ -168,7 +168,7 @@ echo "$api" | grep -q '<script' && fail "api client received the page" "$PREFIX"
 
 page=$(curl -sS "http://127.0.0.1:$HTTP/")
 echo "$page" | grep -q "Checking your browser" || fail "no challenge page" "$PREFIX"
-token=$(printf '%s' "$page" | sed -n 's/.*var ch="\([^"]*\)".*/\1/p')
+token=$(printf '%s' "$page" | sed -n 's/.*var srg=\["\([^"]*\)".*/\1/p')
 if [ -z "$token" ]; then
     fail "challenge token missing" "$PREFIX"
 fi

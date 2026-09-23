@@ -127,4 +127,25 @@ describe("decision snapshot", function()
         assert(r.action == "block")
         assert(r.incident == "srg-manual")
     end)
+
+    it("round-trips a host decision and keeps it out of the ip trie", function()
+        local snap = {
+            mode = "attack",
+            list = {
+                {
+                    family = "host", bits = 0, key = "a.io",
+                    action = "challenge", reason = "host_surge",
+                    message = "site", close = false, status = 429,
+                    ttl = 60, incident = "srg-h",
+                },
+            },
+        }
+        local back = decisions.decode(decisions.encode(snap)).list
+        assert(back[1].family == "host")
+        assert(back[1].key == "a.io")
+        assert(back[1].reason == "host_surge")
+        -- "a.io" is four bytes. It must not become the ipv4 97.46.105.111.
+        local t4 = decisions.build(back)
+        assert(decisions.lookup(t4, "a.io", yes) == nil)
+    end)
 end)

@@ -50,6 +50,25 @@ describe("escalation", function()
         assert(s2.stage == "block")
     end)
 
+    it("stops a capped key at challenge, even for api or no page", function()
+        local st = escalation.new("srg-5")
+        local o = {
+            consecutive = 1, confidence_skip = 0.5,
+            ttl_base = 10, ttl_max = 40, challenge_ready = false,
+        }
+        escalation.step(st, true, 1, o, 0, "challenge", true)
+        assert(st.stage == "limit")
+        escalation.step(st, true, 1, o, 1, "challenge", true)
+        assert(st.stage == "challenge")
+        for t = 2, 6 do
+            escalation.step(st, true, 1, o, t, "challenge", true)
+            assert(st.stage == "challenge")
+        end
+        assert(st.until_ts == 16)
+        escalation.step(st, false, 0, o, 17, nil)
+        assert(st.stage == "observe")
+    end)
+
     it("waits for consecutive ticks when confidence is low", function()
         local slow = {
             consecutive = 3, confidence_skip = 0.99,

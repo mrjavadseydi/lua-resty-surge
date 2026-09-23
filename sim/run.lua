@@ -1,4 +1,5 @@
--- Leader-tick simulation of the seven scenarios in the spec.
+-- Leader-tick simulation of the seven scenarios in the spec, plus a
+-- spread botnet on one site of a shared node.
 --
 -- Each tick builds the merged top-K the workers would have published and
 -- runs analyzer.run. Fingerprints are omitted while the mode is normal,
@@ -104,7 +105,7 @@ local function zipf_uris(total)
     return uris
 end
 
-local function merged(ips, fps, uris)
+local function merged(ips, fps, uris, hosts)
     local i4, s4 = {}, {}
     for ip, n in pairs(ips) do
         if n > 0 then
@@ -126,16 +127,22 @@ local function merged(ips, fps, uris)
             add(u, k, n)
         end
     end
+    local h = {}
+    for k, n in pairs(hosts or {}) do
+        if n > 0 then
+            add(h, k, n)
+        end
+    end
     return {
-        i4 = i4, i6 = {}, s4 = s4, s6 = {}, f = f, u = u,
+        i4 = i4, i6 = {}, s4 = s4, s6 = {}, f = f, u = u, h = h,
         _totals = {
             i4 = sum(i4), i6 = 0, s4 = sum(s4), s6 = 0,
-            f = sum(f), u = sum(u),
+            f = sum(f), u = sum(u), h = sum(h),
         },
     }
 end
 
-local function matches(rec, ip, uri, fp)
+local function matches(rec, ip, uri, fp, host)
     if rec.uri and rec.uri ~= "" then
         if uri:sub(1, #rec.uri) ~= rec.uri then
             return false
@@ -143,6 +150,9 @@ local function matches(rec, ip, uri, fp)
     end
     if rec.family == "fp" then
         return fp ~= nil and rec.key == fp
+    end
+    if rec.family == "host" then
+        return host ~= nil and rec.key == host
     end
     if rec.family ~= "v4" then
         return false
@@ -153,13 +163,13 @@ local function matches(rec, ip, uri, fp)
     return rec.key == ip
 end
 
-local function verdict(list, ip, uri, fp)
+local function verdict(list, ip, uri, fp, host)
     local hit
     for i = 1, #list do
         local rec = list[i]
         local action = rec.action
         if (action == "block" or action == "challenge" or action == "limit")
-            and matches(rec, ip, uri, fp)
+            and matches(rec, ip, uri, fp, host)
         then
             -- A /32 outranks a /24. A fingerprint hit counts too.
             if not hit then
@@ -182,12 +192,13 @@ local function new_world(params)
     }
 end
 
-local function step(world, ips, uris, fps_or_nil)
+local function step(world, ips, uris, fps_or_nil, hosts)
     local fps = nil
     if world.mode ~= "normal" then
         fps = fps_or_nil
     end
-    local snap = analyzer.run(world.ctx, merged(ips, fps, uris), world.now, world.prev)
+    local snap = analyzer.run(world.ctx, merged(ips, fps, uris, hosts),
+        world.now, world.prev)
     world.now = world.now + world.ctx.params.tick
     world.prev = snap.list
     world.mode = snap.mode
@@ -203,7 +214,8 @@ local function warm(world, seconds, rps)
         total = 20
     end
     for _ = 1, ticks do
-        step(world, legit_counts(total), zipf_uris(total), browser_fps(total))
+        step(world, legit_counts(total), zipf_uris(total), browser_fps(total),
+            world.hosts and world.hosts(total))
     end
 end
 
@@ -244,8 +256,19 @@ local function account(world, ips, uri_of, fp_of, acc, attackers)
     end
 end
 
-local function scenario(title, params, body)
+-- Twenty sites on one node. site1 is 40% of traffic, victim.io is 1%.
+local function legit_hosts(total)
+    local out = { ["site1.io"] = total * 0.40, ["victim.io"] = total * 0.01 }
+    local each = total * 0.59 / 18
+    for i = 2, 19 do
+        out["site" .. i .. ".io"] = each
+    end
+    return out
+end
+
+local function scenario(title, params, body, hosts)
     local world = new_world(params)
+    world.hosts = hosts
     warm(world, params.warmup + params.tick * 4, 200)
     local acc = {
         legit = 0, fp = 0, attack = 0, fn = 0, attack_hit = 0, collateral = 0,
@@ -253,6 +276,7 @@ local function scenario(title, params, body)
         mode = world.mode,
     }
     local t0 = world.now
+    acc.t0 = t0
     local function mark(attacker_keys)
         if not acc.detected and world.mode ~= "normal" then
             acc.detected = true
@@ -468,6 +492,77 @@ local function run_preset(name)
         acc.note = "mode " .. world.mode
     end)
 
+    rows[8] = scenario("botnet on 1 of 20 sites", params, function(world, acc, mark)
+        local legit_n = math.floor(base_rps * TICK + 0.5)
+        local ips = legit_counts(legit_n)
+        local hosts = legit_hosts(legit_n)
+        local legit_share = {}
+        for h, n in pairs(hosts) do
+            legit_share[h] = n / legit_n
+        end
+        -- 5000 addresses, random paths, random fingerprints: no ip, /24,
+        -- or fingerprint is heavy. Only the site is.
+        local bot_n = 5000
+        local attackers = {}
+        for i = 1, 64 do
+            local ip = ip4(200000 + i * 300)
+            ips[ip] = math.floor(bot_n / 64)
+            attackers[ip] = true
+        end
+        hosts["victim.io"] = hosts["victim.io"] + bot_n
+        local uris = zipf_uris(legit_n)
+        for i = 1, 100 do
+            uris["/r/" .. i] = bot_n / 100
+        end
+        local fps = browser_fps(legit_n)
+        for i = 1, 200 do
+            fps[string.format("1GET11rand%05d", i)] = bot_n / 200
+        end
+        local victim_legit, victim_hit = 0, 0
+        for _ = 1, math.floor(10 / TICK) do
+            step(world, ips, uris, fps, hosts)
+            mark({})
+            if not acc.block_at then
+                local rec = find_action(world.list, "victim.io")
+                if rec and rec.action == "challenge" then
+                    acc.block_at = world.now - acc.t0
+                    acc.block_family = "host"
+                end
+            end
+            for ip, n in pairs(ips) do
+                if attackers[ip] then
+                    acc.attack = acc.attack + n
+                    local hit = verdict(world.list, ip, "/r/1", nil, "victim.io")
+                    if hit then
+                        acc.attack_hit = acc.attack_hit + n
+                    elseif acc.detected then
+                        acc.fn = acc.fn + n
+                    end
+                else
+                    -- A legit address spreads its requests over the sites.
+                    for h, share in pairs(legit_share) do
+                        local k = n * share
+                        local hit = verdict(world.list, ip, "/", FP_CHROME, h)
+                        if h == "victim.io" then
+                            victim_legit = victim_legit + k
+                            if hit then
+                                victim_hit = victim_hit + k
+                            end
+                        else
+                            acc.legit = acc.legit + k
+                            if hit then
+                                acc.fp = acc.fp + k
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        acc.note = string.format(
+            "challenge; victim.io legit challenged %d/%d",
+            math.floor(victim_hit + 0.5), math.floor(victim_legit + 0.5))
+    end, legit_hosts)
+
     return rows
 end
 
@@ -475,7 +570,8 @@ local function line(row)
     return string.format(
         "%-28s detect %-8s block %-8s fp %s (%d/%d) fn %s collateral %d  %s%s",
         row.title, fmt_t(row.detect), fmt_t(row.block),
-        fmt_p(row.fp), row.fp_n, row.legit, fmt_p(row.fn),
+        fmt_p(row.fp), math.floor(row.fp_n + 0.5), math.floor(row.legit + 0.5),
+        fmt_p(row.fn),
         row.collateral,
         (row.block_family and (row.block_family .. (row.block_uri and (" " .. row.block_uri) or "") .. " ") or ""),
         row.note or "")
@@ -510,6 +606,11 @@ local function main()
             if name == "balanced" and rows[r].title == "slow ramp 2%/min" then
                 local x = tonumber((rows[r].note or ""):match("detect at ([%d%.]+)x"))
                 if not x or x >= 3 then
+                    fail = true
+                end
+            end
+            if name == "balanced" and rows[r].title == "botnet on 1 of 20 sites" then
+                if not rows[r].block or rows[r].block > 1 or rows[r].fp_n > 0 then
                     fail = true
                 end
             end

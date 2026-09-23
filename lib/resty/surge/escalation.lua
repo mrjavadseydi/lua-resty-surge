@@ -6,6 +6,7 @@
 -- In dry-run the caller passes cap "observe", so the stage never leaves the
 -- log-only state. API keys pass api_only and skip challenge: there is no
 -- page to run for a client that does not execute JavaScript.
+-- Cap "challenge" stops a host decision there and keeps extending it.
 
 local _M = {}
 
@@ -35,6 +36,14 @@ function _M.step(st, offending, confidence, opts, now, cap, api_only)
             st.stage = "observe"
             st.ttl = 0
         end
+        return st
+    end
+
+    -- A site-wide decision tops out at challenge. Blocking a host is the outage.
+    if cap == "challenge" and st.stage == "challenge" then
+        st.streak = 0
+        st.confidence = confidence
+        st.until_ts = now + (st.ttl > 0 and st.ttl or (opts.ttl_base or 60))
         return st
     end
 
@@ -68,7 +77,9 @@ function _M.step(st, offending, confidence, opts, now, cap, api_only)
         st.ttl = base
     elseif st.stage == "limit" then
         -- API paths cannot run the page. challenge_ready false skips it too.
-        if api_only or opts.api_only or opts.challenge_ready == false then
+        if cap ~= "challenge"
+            and (api_only or opts.api_only or opts.challenge_ready == false)
+        then
             enter_block()
         else
             st.stage = "challenge"
