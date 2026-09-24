@@ -162,6 +162,12 @@ end
 
 local FAMILY = { [6] = "v6", [16] = "fp", [32] = "host" }
 
+-- The blob outlives a reload in the shared dict, so new code can meet an
+-- old blob. Bump FORMAT on any layout change: a worker then skips the old
+-- blob until the leader republishes, instead of misreading it.
+local FORMAT = 1
+local HEADER = "S" .. char(FORMAT)
+
 function _M.encode(snap)
     local list = snap.list or {}
     -- The count is u16. Past it, drop the tail here instead of letting the
@@ -170,7 +176,7 @@ function _M.encode(snap)
     if n > 65535 then
         n = 65535
     end
-    local parts = { wstr(snap.mode or "normal"), u16(n) }
+    local parts = { HEADER, wstr(snap.mode or "normal"), u16(n) }
     for i = 1, n do
         local r = list[i]
         local fam = 4
@@ -216,7 +222,10 @@ function _M.decode(blob)
     if type(blob) ~= "string" then
         return nil, "empty snapshot"
     end
-    local mode, i = rstr(blob, 1)
+    if sub(blob, 1, 2) ~= HEADER then
+        return nil, "format"
+    end
+    local mode, i = rstr(blob, 3)
     if not mode then
         return nil, "truncated mode"
     end

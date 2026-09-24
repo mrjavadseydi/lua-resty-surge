@@ -7,7 +7,7 @@ IMAGE ?= lua-resty-surge/harness:latest
 OPENRESTY_IMAGE ?= openresty/openresty:1.31.1.1-3-jammy
 RUN := docker run --rm -v $(CURDIR):/work -w /work $(IMAGE)
 
-.PHONY: image image-if-missing test test-unit smoke feeds phase6 sim bench bench7 bench-cost microbench radix shell version
+.PHONY: image image-if-missing test test-unit smoke feeds phase6 sidecar sim bench bench7 bench-cost microbench radix shell version
 
 image:
 	docker build -t $(IMAGE) --build-arg OPENRESTY_IMAGE=$(OPENRESTY_IMAGE) -f docker/Dockerfile.test docker
@@ -30,6 +30,9 @@ feeds: | image-if-missing
 phase6: | image-if-missing
 	$(RUN) sh t/phase6.sh
 
+sidecar: | image-if-missing
+	$(RUN) sh t/sidecar.sh
+
 sim: | image-if-missing
 	mkdir -p sim/results
 	$(RUN) resty sim/run.lua | tee sim/results/phase7.txt
@@ -49,7 +52,7 @@ radix: | image-if-missing
 microbench: | image-if-missing
 	$(RUN) resty bench/microbench.lua
 
-test: test-unit smoke feeds phase6
+test: test-unit smoke feeds phase6 sidecar
 
 shell: | image-if-missing
 	docker run --rm -it -v $(CURDIR):/work -w /work $(IMAGE)

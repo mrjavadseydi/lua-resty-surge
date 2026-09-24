@@ -39,7 +39,7 @@ http {
         require("resty.surge").start({
             allow = { "/health" },
             dry_run = $dry,
-            advanced = { test_hooks = true, tick = 0.25 },
+            advanced = { test_hooks = true, tick = 0.25, pow_bits = 8 },
             export_path = "$prefix/export/blocks.txt",
         })
     }
@@ -64,10 +64,25 @@ http {
         location = /_host {
             content_by_lua_block {
                 local ok, err = require("resty.surge")._publish({
-                    { host = "victim.test", action = "challenge",
+                    -- Mixed case on purpose: ngx.var.host is lowercase.
+                    { host = "Victim.test", action = "challenge",
                       reason = "host_surge", message = "site challenge" },
                 })
                 ngx.say(ok and "published" or err)
+            }
+        }
+
+        # A token and a nonce that solves it, as the page's script would.
+        location = /_pow {
+            content_by_lua_block {
+                local ch = require "resty.surge.challenge"
+                local sha = require "resty.surge.sha256"
+                local t = ch.token(ngx.var.binary_remote_addr, ngx.now(), 60, 8)
+                for n = 0, 1000000 do
+                    if sha.leading_zeros(sha.sha256(t .. n)) >= 8 then
+                        return ngx.print(t, " ", n)
+                    end
+                end
             }
         }
 
@@ -202,11 +217,27 @@ echo "$page" | grep -q '/.srg-pow.v1.js' || fail "no challenge page: $page" "$PR
 js=$(curl -sS -D - -H 'Host: victim.test' "http://127.0.0.1:$PORT/.srg-pow.v1.js")
 echo "$js" | grep -qi "Cache-Control: public" || fail "script not cacheable: $js" "$PREFIX"
 echo "$js" | grep -q "window.srg" || fail "script body: $js" "$PREFIX"
-i=1
-while [ "$i" -lt 10 ]; do
+# A browser's fetch cannot run the page, so it is not ignoring it.
+i=0
+while [ "$i" -lt 12 ]; do
+    curl -s -o /dev/null -H 'Host: victim.test' -H 'Sec-Fetch-Dest: empty' \
+        "http://127.0.0.1:$PORT/"
+    i=$((i + 1))
+done
+# A solve takes one page back. 1 page so far, minus 1, plus 9 stays under 10.
+set -- $(curl -sf "http://127.0.0.1:$PORT/_pow")
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
+    "http://127.0.0.1:$PORT/?srg_ch=$1&srg_pow=$2")
+[ "$code" = "204" ] || fail "solve was not accepted ($code)" "$PREFIX"
+i=0
+while [ "$i" -lt 9 ]; do
     curl -s -o /dev/null -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
     i=$((i + 1))
 done
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/" || true)
+[ "$code" = "200" ] || fail "blocked despite fetches and a solve ($code)" "$PREFIX"
+curl -s -o /dev/null -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
 sleep 0.8
 # A bot that ignored the page gets a closed socket (444), not a body.
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/" || true)
@@ -214,6 +245,10 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.
 curl -sf "http://127.0.0.1:$PORT/_surge" | grep -q '"reason":"challenge_ignored"' \
     || fail "block reason missing from status" "$PREFIX"
 grep -q "^v4 32 127.0.0.1 " "$PREFIX/export/blocks.txt" || fail "block not exported" "$PREFIX"
+# The script path is not a way around a block while a challenge is live.
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
+    "http://127.0.0.1:$PORT/.srg-pow.v1.js" || true)
+[ "$code" = "000" ] || fail "blocked address got the script ($code)" "$PREFIX"
 
 echo "block path ok"
 

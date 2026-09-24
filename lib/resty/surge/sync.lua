@@ -128,7 +128,9 @@ local function pull(state)
     end
     local snap, err = decisions.decode(blob)
     if not snap then
-        ngx.log(ngx.ERR, "surge: bad decision snapshot: ", err or "")
+        -- "format" is expected once after an upgrade; the leader republishes.
+        ngx.log(err == "format" and ngx.NOTICE or ngx.ERR,
+            "surge: bad decision snapshot: ", err or "")
         state.box.ver = ver
         return
     end
