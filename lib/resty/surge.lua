@@ -115,27 +115,25 @@ local function empty_box()
     }
 end
 
-local function index_family(list, family)
-    local out = {}
-    local n = 0
-    for i = 1, #list do
-        local r = list[i]
-        if r.family == family then
-            out[r.key] = r
-            n = n + 1
-        end
-    end
-    return out, n
-end
-
 local function install(snap)
     -- Limiter state lives only as long as its decision.
     local live = {}
+    local fp, fp_n, hosts, host_n, chal_n = {}, 0, {}, 0, 0
     for i = 1, #snap.list do
         local r = snap.list[i]
         respond.build(r, cfg.expose)
         if r.incident and tats[r.incident] then
             live[r.incident] = tats[r.incident]
+        end
+        if r.family == "fp" then
+            fp[r.key] = r
+            fp_n = fp_n + 1
+        elseif r.family == "host" then
+            hosts[r.key] = r
+            host_n = host_n + 1
+        end
+        if r.action == "challenge" then
+            chal_n = chal_n + 1
         end
     end
     tats = live
@@ -150,14 +148,8 @@ local function install(snap)
     box.mean = snap.mean
     box.sigma = snap.sigma
     box.entropy = snap.entropy
-    box.fp, box.fp_n = index_family(snap.list, "fp")
-    box.hosts, box.host_n = index_family(snap.list, "host")
-    local chal_n = 0
-    for i = 1, #snap.list do
-        if snap.list[i].action == "challenge" then
-            chal_n = chal_n + 1
-        end
-    end
+    box.fp, box.fp_n = fp, fp_n
+    box.hosts, box.host_n = hosts, host_n
     box.chal_n = chal_n
 end
 
@@ -500,7 +492,9 @@ local function ignored_rule(hex)
         return string.char(tonumber(h, 16))
     end)
     if #bin == 16 then
-        return { bin = bin:sub(1, 8) .. string.rep("\0", 8), bits = 64, v6 = true }
+        -- Prefix bytes only, like an auto /64 key, so the dedup below sees
+        -- an existing auto block of the same net.
+        return { bin = bin:sub(1, 8), bits = 64, v6 = true }
     end
     return { bin = bin, bits = 32, v6 = false }
 end
@@ -509,13 +503,17 @@ end
 -- worker served it. A worker's list can be a tick stale, and publishing it
 -- would drop a live block the leader then forgets. The leader is the only
 -- writer of the snapshot.
+local MAX_IGNORED = 16384
+
 local function apply_ops(now)
     local dict = state.dict
     local list = box.list or {}
     local changed = false
     local blocked
     -- ponytail: every challenge_ignored block rides in the one decision blob
-    -- (~150 B each). Past tens of thousands, give them their own blob.
+    -- (~150 B each), so they stop at MAX_IGNORED. Past that an address just
+    -- keeps getting the page. Give them their own blob if that bites.
+    local room
     for _ = 1, 4096 do
         local op = dict:lpop("ops")
         if not op then
@@ -540,8 +538,17 @@ local function apply_ops(now)
                     end
                 end
             end
+            if not room then
+                room = MAX_IGNORED
+                for i = 1, #list do
+                    if list[i].reason == "challenge_ignored" then
+                        room = room - 1
+                    end
+                end
+            end
             local id = rule.bin .. "/" .. rule.bits
-            if not blocked[id] then
+            if not blocked[id] and room > 0 then
+                room = room - 1
                 blocked[id] = true
                 -- close: a bot gets no body and no headers, just a closed socket.
                 list[#list + 1] = manual_record({
@@ -694,6 +701,16 @@ local function tally_key(d, key, nbytes)
     end
 end
 
+-- The key observe() tallies and protect() looks up. A long Host header is
+-- cut to 128 bytes on both sides, or its decision could never match.
+local function host_key()
+    local host = ngx.var.host
+    if host and #host > 128 then
+        return host:sub(1, 128)
+    end
+    return host
+end
+
 local function observe(family, bin, fp_key)
     sample_n = sample_n + 1
     local mod = box.sample
@@ -718,9 +735,9 @@ local function observe(family, bin, fp_key)
     if fp_key and state.fp then
         tally_key(state.fp, fp_key)
     end
-    local host = ngx.var.host
+    local host = host_key()
     if host and host ~= "" then
-        tally_key(state.host, host, #host > 128 and 128 or nil)
+        tally_key(state.host, host)
     end
 end
 
@@ -750,13 +767,13 @@ local function api_request()
     return false
 end
 
-local cookie_checked, cookie_pass
+local cookie_checked, cookie_pass, script_req
 
--- Verified cookie value -> the address it was last verified from. A viewer
--- sends the same cookie on every request; one HMAC per worker per 30s
--- instead of one per request. A different address re-verifies, because the
--- cookie is bound to a /24 or /64.
--- ponytail: 30s cache ttl, so a cookie can outlive its expiry by up to 30s.
+-- Secret version .. verified cookie value -> the address it was last
+-- verified from. A viewer sends the same cookie on every request; one HMAC
+-- per worker per 30s instead of one per request. A different address
+-- re-verifies, because the cookie is bound to a /24 or /64. A new secret
+-- version misses the cache, and an entry never outlives the cookie.
 local pass_cache = require("resty.lrucache").new(20000)
 local PASS_TTL = 30
 
@@ -771,15 +788,32 @@ end
 
 -- Count unsolved challenge pages per address across workers. At
 -- chal_ignore pages in 10s the address is queued for a block, which
--- early() and the nftables export then pick up.
+-- early() and the nftables export then pick up. Only navigations count:
+-- a browser's fetch, image or script (Sec-Fetch-Dest set, not "document")
+-- cannot run the page, so it is not ignoring it. A solve takes one back,
+-- so a NAT of real users solving does not add up to a block.
+-- ponytail: a bot that sends Sec-Fetch-Dest: empty is never counted. It
+-- still only ever gets the page; the block just saves the bytes.
 local function note_page(bin)
     local limit = cfg.params.chal_ignore
     if not shared or not limit or limit <= 0 then
         return
     end
+    local dest = ngx.var.http_sec_fetch_dest
+    if dest and dest ~= "document" then
+        return
+    end
     local n = shared:incr("cf:" .. bin, 1, 0, 10)
     if n == limit then
         shared:rpush("ops", "c\0" .. sha.hex(bin) .. "\0" .. cfg.params.ttl_base)
+    end
+end
+
+local function note_solved(bin)
+    local key = "cf:" .. bin
+    local n = shared and shared:get(key)
+    if n and n > 0 then
+        shared:incr(key, -1)
     end
 end
 
@@ -793,14 +827,19 @@ local function verified(bin)
     if not value then
         return false
     end
-    if pass_cache:get(value) == bin then
+    local ckey = secret_ver .. ":" .. value
+    if pass_cache:get(ckey) == bin then
         cookie_pass = true
         return true
     end
-    cookie_pass = challenge.valid_value(value, bin, ngx.now(),
+    local now = ngx.now()
+    cookie_pass = challenge.valid_value(value, bin, now,
         secret_cur, secret_prev, secret_ver, secret_prev_ver)
     if cookie_pass then
-        pass_cache:set(value, bin, PASS_TTL)
+        local left = (tonumber(value:match("^v1%.(%d+)")) or 0) - now
+        if left > 0 then
+            pass_cache:set(ckey, bin, left < PASS_TTL and left or PASS_TTL)
+        end
     end
     return cookie_pass
 end
@@ -880,6 +919,10 @@ local function apply_dec(dec, bin, pass)
         return dec
     end
     if dec.action == "challenge" then
+        -- The page's own script must load for the challenge to be solved.
+        if script_req then
+            return nil
+        end
         if api_request() then
             -- A whole site cannot 403 its API. Hold it to the site rate.
             if dec.family == "host" then
@@ -889,6 +932,7 @@ local function apply_dec(dec, bin, pass)
         end
         local baked = try_pow(bin)
         if baked then
+            note_solved(bin)
             -- 204 keeps the document in place so a POST can be resubmitted.
             return "solved", baked
         end
@@ -951,10 +995,9 @@ local function protect_inner()
     if allowed_ip(family, bin) or allowed_path() or ipdb.hit(good, bin) then
         return nil
     end
-    -- The uri is read only while some challenge is live.
-    if box.chal_n > 0 and ngx.var.uri == challenge.SCRIPT_PATH then
-        return "script"
-    end
+    -- The uri is read only while some challenge is live. The script still
+    -- goes through blocks and limits, and is counted like any request.
+    script_req = box.chal_n > 0 and ngx.var.uri == challenge.SCRIPT_PATH
 
     local trie = family == "v6" and box.trie6 or box.trie4
     local dec = decisions.lookup(trie, bin, accept_dec)
@@ -996,7 +1039,7 @@ local function protect_inner()
     -- Host is read only while some site has a decision.
     local hostdec
     if box.host_n > 0 then
-        hostdec = box.hosts[ngx.var.host or ""]
+        hostdec = box.hosts[host_key() or ""]
     end
 
     -- No decision means nothing for the cookie to skip. Attack mode would
@@ -1019,6 +1062,11 @@ local function protect_inner()
     end
     out, extra = apply_dec(hostdec, bin, pass)
     if out then
+        -- A site cap must not hide the flood it caps: the analyzer judges
+        -- the host by its share, and a capped share looks like it ended.
+        if out ~= "solved" then
+            observe(family, bin, fp_key)
+        end
         return out, extra
     end
 
@@ -1030,6 +1078,9 @@ local function protect_inner()
     end
 
     observe(family, bin, fp_key)
+    if script_req then
+        return "script"
+    end
     return nil
 end
 
@@ -1548,7 +1599,8 @@ function _M._publish(items, mode)
     for i = 1, #items do
         local it = items[i]
         if it.host then
-            local rec = manual_record(it, { bin = it.host, bits = 0 }, now)
+            -- ngx.var.host is always lowercase.
+            local rec = manual_record(it, { bin = it.host:lower(), bits = 0 }, now)
             rec.family = "host"
             list[#list + 1] = rec
         else

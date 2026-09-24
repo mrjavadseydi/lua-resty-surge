@@ -8,8 +8,10 @@
 #
 # Run --watch under systemd, not cron: a minute of cron delay is a minute
 # of blocked clients still costing a TLS handshake each. The file is
-# applied only when it changed. The ttl in each line was counted when the
-# file was written, so re-applying an unchanged file would extend blocks.
+# applied when it changed, or when the table is gone (nft flush ruleset, a
+# reload of nftables.conf). The ttl in each line was counted when the file
+# was written, so each element gets ttl minus the file's age: re-applying an
+# old file never extends a block.
 #
 # Sets use "flags interval, timeout" so /24 and /64 elements are legal.
 # flush and add run as one nft -f transaction. A rejected element leaves
@@ -28,6 +30,11 @@ SET4=${SET4:-block4}
 SET6=${SET6:-block6}
 LAST=${LAST:-$FILE.applied}
 
+snap=
+batch=
+trap 'rm -f "$snap" "$batch"' EXIT
+trap 'exit 143' INT TERM
+
 ensure_set() {
     name=$1
     typ=$2
@@ -45,11 +52,13 @@ apply_file() {
     [ -f "$FILE" ] || return 0
     # Copy first: surge may rename a new file in while this runs.
     snap=$(mktemp)
-    cp "$FILE" "$snap"
-    if [ -f "$LAST" ] && cmp -s "$snap" "$LAST"; then
+    cp -p "$FILE" "$snap"
+    if [ -f "$LAST" ] && cmp -s "$snap" "$LAST" \
+        && nft list table "$FAMILY" "$TABLE" >/dev/null 2>&1; then
         rm -f "$snap"
         return 0
     fi
+    age=$(( $(date +%s) - $(stat -c %Y "$snap") ))
 
     nft list table "$FAMILY" "$TABLE" >/dev/null 2>&1 || nft add table "$FAMILY" "$TABLE"
     ensure_set "$SET4" ipv4_addr
@@ -69,6 +78,7 @@ apply_file() {
             case "$ttl" in
                 ''|*[!0-9]*) continue ;;
             esac
+            ttl=$((ttl - age))
             if [ "$ttl" -le 0 ]; then
                 continue
             fi
@@ -83,11 +93,13 @@ apply_file() {
     rc=0
     nft -f "$batch" || rc=$?
     rm -f "$batch"
+    batch=
     if [ "$rc" -ne 0 ]; then
         rm -f "$snap"
         return "$rc"
     fi
     mv "$snap" "$LAST"
+    snap=
 }
 
 if [ "$WATCH" = 1 ]; then

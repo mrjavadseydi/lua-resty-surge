@@ -164,8 +164,14 @@ local FAMILY = { [6] = "v6", [16] = "fp", [32] = "host" }
 
 function _M.encode(snap)
     local list = snap.list or {}
-    local parts = { wstr(snap.mode or "normal"), u16(#list) }
-    for i = 1, #list do
+    -- The count is u16. Past it, drop the tail here instead of letting the
+    -- count wrap and the decoder drop records nobody chose.
+    local n = #list
+    if n > 65535 then
+        n = 65535
+    end
+    local parts = { wstr(snap.mode or "normal"), u16(n) }
+    for i = 1, n do
         local r = list[i]
         local fam = 4
         if r.family == "v6" then
@@ -199,6 +205,9 @@ function _M.encode(snap)
             conf = 10000
         end
         parts[#parts + 1] = u16(conf)
+        -- A host decision's site cap. Without it every worker but the leader
+        -- falls back to limit_rps. Milli-rps, so a fractional cap survives.
+        parts[#parts + 1] = u32((r.rate or 0) * 1000)
     end
     return table.concat(parts)
 end
@@ -249,7 +258,9 @@ function _M.decode(blob)
         until_ts, i = r32(blob, i + 1)
         local conf_i
         conf_i, i = r16(blob, i)
-        if not incident or not ttl or not until_ts or not conf_i then
+        local rate_m
+        rate_m, i = r32(blob, i)
+        if not incident or not ttl or not until_ts or not conf_i or not rate_m then
             return nil, "truncated tail"
         end
         list[k] = {
@@ -267,6 +278,7 @@ function _M.decode(blob)
             manual = flags == 1,
             until_ts = until_ts ~= 0 and until_ts or nil,
             confidence = conf_i > 0 and (conf_i / 10000) or nil,
+            rate = rate_m > 0 and (rate_m / 1000) or nil,
         }
     end
     return { mode = mode, list = list }

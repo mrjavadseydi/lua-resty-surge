@@ -136,7 +136,7 @@ describe("decision snapshot", function()
                     family = "host", bits = 0, key = "a.io",
                     action = "challenge", reason = "host_surge",
                     message = "site", close = false, status = 429,
-                    ttl = 60, incident = "srg-h",
+                    ttl = 60, incident = "srg-h", rate = 2000.5,
                 },
             },
         }
@@ -144,6 +144,8 @@ describe("decision snapshot", function()
         assert(back[1].family == "host")
         assert(back[1].key == "a.io")
         assert(back[1].reason == "host_surge")
+        -- The site cap crosses workers; limit_rps is not the fallback.
+        assert(back[1].rate == 2000.5)
         -- "a.io" is four bytes. It must not become the ipv4 97.46.105.111.
         local t4 = decisions.build(back)
         assert(decisions.lookup(t4, "a.io", yes) == nil)
