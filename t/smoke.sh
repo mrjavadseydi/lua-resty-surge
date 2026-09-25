@@ -39,7 +39,8 @@ http {
         require("resty.surge").start({
             allow = { "/health" },
             dry_run = $dry,
-            advanced = { test_hooks = true, tick = 0.25, pow_bits = 8 },
+            -- gcra_burst 100 so a per-worker burst (2 x 100) would show.
+            advanced = { test_hooks = true, tick = 0.25, pow_bits = 8, gcra_burst = 100 },
             export_path = "$prefix/export/blocks.txt",
         })
     }
@@ -210,6 +211,15 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
     -H 'Accept: application/json' "http://127.0.0.1:$PORT/api")
 [ "$code" = "200" ] || fail "api under a site challenge was denied ($code)" "$PREFIX"
+# The site rate and burst are the node's: 80 x 2s + 100 = 260. Per worker
+# it was 2 x (40 x 2s + 100) = 360.
+out=$(wrk -t1 -c1 -d2s -H 'Host: victim.test' -H 'Accept: application/json' \
+    "http://127.0.0.1:$PORT/api")
+total=$(echo "$out" | awk '/requests in/ { print $1 }')
+denied=$(echo "$out" | awk '/Non-2xx/ { print $5 }')
+passed=$((total - ${denied:-0}))
+[ "$passed" -ge 230 ] && [ "$passed" -le 300 ] \
+    || fail "site limit let $passed of $total through in 2s" "$PREFIX"
 page=$(curl -s -H 'Host: victim.test' "http://127.0.0.1:$PORT/")
 echo "$page" | grep -q '/.srg-pow.v1.js' || fail "no challenge page: $page" "$PREFIX"
 [ "$(printf %s "$page" | wc -c)" -lt 400 ] || fail "challenge page is too big" "$PREFIX"

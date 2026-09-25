@@ -49,10 +49,40 @@ describe("gcra", function()
         end
     end)
 
-    it("divides only the rate across workers", function()
-        local interval, tau = gcra.worker_params(100, 4, 4)
-        local one, _ = gcra.params(25, 4)
-        assert(math.abs(interval - one) < 1e-12)
-        assert(math.abs(tau - 3 / 25) < 1e-12)
+    it("runs the same limit on a shared dict", function()
+        -- Enough of ngx.shared.DICT:incr for the algorithm.
+        local d = { v = {} }
+        function d:incr(k, by, init)
+            local cur = self.v[k]
+            if cur == nil then
+                if init == nil then
+                    return nil, "not found"
+                end
+                cur = init
+            end
+            self.v[k] = cur + by
+            return self.v[k]
+        end
+        -- Rate 8: every tat below is exact in binary, so no boundary rounds.
+        local interval, tau = gcra.params(8, 5)
+        local ok_n = 0
+        for _ = 1, 20 do
+            if gcra.shared(d, "k", 100, interval, tau, 60) then
+                ok_n = ok_n + 1
+            end
+        end
+        -- The burst at one instant, as check() allows.
+        assert(ok_n == 5)
+        -- Denied requests gave their interval back: one more a cell later.
+        assert(gcra.shared(d, "k", 100.1875, interval, tau, 60) == true)
+        assert(gcra.shared(d, "k", 100.1875, interval, tau, 60) == false)
+        -- A long gap resets to now instead of banking credit.
+        ok_n = 0
+        for _ = 1, 20 do
+            if gcra.shared(d, "k", 500, interval, tau, 60) then
+                ok_n = ok_n + 1
+            end
+        end
+        assert(ok_n == 5)
     end)
 end)

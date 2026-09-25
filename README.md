@@ -77,7 +77,7 @@ Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ...
 
 This is not a firewall for volumetric L3 or L4 floods. If the uplink is full, nothing in nginx helps. Check the NIC graphs during an incident to tell a full link from busy workers. A block can be written to `export_path` for `examples/nftables-sidecar.sh --watch` to load into nftables within a second. Run it under systemd, not cron. A minute of cron delay is a minute of blocked clients still costing a TLS handshake each. That file is not written while `dry_run` is on, so a dry run cannot drop clients in the kernel. The module never runs a shell command itself.
 
-The rate limit is per worker, so a client that hits every worker can burst about `workers` times the configured burst. The sketch overestimates a little. Fingerprints are computed only after the mode leaves normal, and then only on sampled requests unless a fingerprint decision is live, because reading headers on every request costs too much. `early()` cannot see a path allow. ASN lookup is not included.
+The rate limit is one GCRA per decision in the shared dictionary, so its rate and burst hold for the node whichever worker a request lands on. Only a request that hits a limit decision touches it: one `incr` when allowed, two when denied. The sketch overestimates a little. Fingerprints are computed only after the mode leaves normal, and then only on sampled requests unless a fingerprint decision is live, because reading headers on every request costs too much. `early()` cannot see a path allow. ASN lookup is not included.
 
 ## Measured results
 

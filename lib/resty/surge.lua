@@ -41,7 +41,6 @@ local state
 local box
 local allow4, allow6, allow_paths
 local sample_n = 0
-local tats = {}
 local sig = ""
 local baseline_saved = ""
 local shared
@@ -116,15 +115,10 @@ local function empty_box()
 end
 
 local function install(snap)
-    -- Limiter state lives only as long as its decision.
-    local live = {}
     local fp, fp_n, hosts, host_n, chal_n = {}, 0, {}, 0, 0
     for i = 1, #snap.list do
         local r = snap.list[i]
         respond.build(r, cfg.expose)
-        if r.incident and tats[r.incident] then
-            live[r.incident] = tats[r.incident]
-        end
         if r.family == "fp" then
             fp[r.key] = r
             fp_n = fp_n + 1
@@ -136,7 +130,6 @@ local function install(snap)
             chal_n = chal_n + 1
         end
     end
-    tats = live
     local t4, t6 = decisions.build(snap.list)
     box.trie4 = t4
     box.trie6 = t6
@@ -853,18 +846,24 @@ local function wants_cookie(dec)
             or dec.action == "limit" or dec.close)
 end
 
+-- One GCRA per decision in the shared dict, so the rate and the burst are
+-- the node's. Per worker, a client on every worker got workers x burst,
+-- and one pinned to a single worker got rate / workers.
+-- ponytail: one hot shm key per decision. No measurable cost at 2 workers
+-- (make bench-cost, site limit row). Per-worker GCRA with burst / workers
+-- if many workers contend on it.
 local function limit_denied(dec)
-    local rate = (dec.rate or cfg.params.limit_rps) / (state.nworkers or 1)
+    local rate = dec.rate or cfg.params.limit_rps
     if rate < 0.001 then
         rate = 0.001
     end
     local interval, tau = gcra.params(rate, cfg.params.gcra_burst)
-    local allowed, tat = gcra.check(tats[dec.incident], ngx.now(), interval, tau)
-    if not allowed then
-        return dec, 429
+    if gcra.shared(shared, "rl:" .. (dec.incident or ""), ngx.now(), interval, tau,
+        cfg.params.ttl_base)
+    then
+        return nil
     end
-    tats[dec.incident] = tat
-    return nil
+    return dec, 429
 end
 
 local function try_pow(bin)

@@ -97,6 +97,7 @@ r() { printf '%-40s' "$1"; shift; wrk -t2 -c32 -d$DUR "$@" | awk '/Requests\/sec
 r "wrk allowed (other site)" -H 'Host: other.test' $U/
 r "wrk site challenge, valid cookie" -H 'Host: victim.test' -H "Cookie: $C" $U/
 r "wrk site challenge, page served" -H 'Host: victim.test' $U/
+r "wrk site limit, api (mostly 429)" -H 'Host: victim.test' -H 'Accept: application/json' $U/api
 r "wrk block 403" $U/blocked
 r "wrk pow script (cached by browsers)" -H "Host: victim.test" $U/.srg-pow.v1.js
 kill $(cat $P/logs/nginx.pid)
