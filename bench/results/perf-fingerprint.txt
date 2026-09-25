@@ -1,0 +1,17 @@
+Attack-mode allocation and time, before and after the parse_raw rewrite,
+the scratch fields table, and the pass-cache key change. Docker harness,
+openresty 1.31.1.1, 2026-09-25. Loop lines are min of 3; each row is two runs.
+
+make bench-cost (loop, 20000 protect() calls)
+                                         before                 after
+attack, allowed (other site)       12756 kb, 1450 ns     2443-2454 kb, 1400-1540 ns
+attack, site challenge + cookie    17581 kb, 2960 ns     6035 kb, 2870-3160 ns
+
+make bench7 (gc line, attack mode)
+                                    1080 kb, 2180 ns       241 kb, 1500 ns
+
+Per call: 638 -> 122 bytes allowed, 879 -> 302 bytes with a cookie.
+The bench-cost ns column moves about 10% between identical runs; bench7 is
+the steadier time. parse_raw was fuzzed against the previous version on
+400k random header blocks (case, CRLF/LF/CR, blank and colon-less lines,
+empty values, srg_pow-only cookies, cap): 0 differences.

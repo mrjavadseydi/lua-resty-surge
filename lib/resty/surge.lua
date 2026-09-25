@@ -769,11 +769,11 @@ end
 
 local cookie_checked, cookie_pass, script_req
 
--- Secret version .. verified cookie value -> the address it was last
--- verified from. A viewer sends the same cookie on every request; one HMAC
+-- Verified cookie value -> { address, secret version } it was last
+-- verified with. A viewer sends the same cookie on every request; one HMAC
 -- per worker per 30s instead of one per request. A different address
 -- re-verifies, because the cookie is bound to a /24 or /64. A new secret
--- version misses the cache, and an entry never outlives the cookie.
+-- version re-verifies, and an entry never outlives the cookie.
 local pass_cache = require("resty.lrucache").new(20000)
 local PASS_TTL = 30
 
@@ -827,8 +827,8 @@ local function verified(bin)
     if not value then
         return false
     end
-    local ckey = secret_ver .. ":" .. value
-    if pass_cache:get(ckey) == bin then
+    local hit = pass_cache:get(value)
+    if hit and hit[1] == bin and hit[2] == secret_ver then
         cookie_pass = true
         return true
     end
@@ -838,7 +838,7 @@ local function verified(bin)
     if cookie_pass then
         local left = (tonumber(value:match("^v1%.(%d+)")) or 0) - now
         if left > 0 then
-            pass_cache:set(ckey, bin, left < PASS_TTL and left or PASS_TTL)
+            pass_cache:set(value, { bin, secret_ver }, left < PASS_TTL and left or PASS_TTL)
         end
     end
     return cookie_pass

@@ -7,7 +7,9 @@
 -- requests, so the version tag changes and the order is omitted.
 
 local bit = require "bit"
+local clear = require "table.clear"
 local byte = string.byte
+local find, sub, lower = string.find, string.sub, string.lower
 local band, bxor, rshift = bit.band, bit.bxor, bit.rshift
 
 local _M = {}
@@ -117,43 +119,65 @@ function _M.presence(headers)
     return table.concat(codes)
 end
 
+-- Scratch for parse_raw and capture. Filled and consumed within one call;
+-- nothing here yields, so one set per worker is enough.
+local order_buf, seen_buf, fields_buf = {}, {}, {}
+
 -- `raw` is the header block without the request line (raw_header(true)).
-function _M.parse_raw(raw, cap)
+-- Walks it by index: no string per line, and a value is cut only for the
+-- three headers the key reads. Header names are short and repeat, so their
+-- sub() is usually an interned hit. `out` is filled if given.
+function _M.parse_raw(raw, cap, out)
     cap = cap or _M.CAP
-    local order, seen = {}, {}
+    raw = raw or ""
+    local order, seen = order_buf, seen_buf
+    clear(order)
+    clear(seen)
     local ua, lang, cookie
-    local n = 0
-    for line in (raw or ""):gmatch("[^\r\n]+") do
-        n = n + 1
-        if n > cap then
-            break
-        end
-        local name, value = line:match("^([^:]+):%s*(.*)$")
-        if name then
-            name = name:lower()
-            local code = CODE[name]
-            if code and not seen[code] then
-                seen[code] = true
-                order[#order + 1] = code
+    local n, pos, len = 0, 1, #raw
+    while pos <= len do
+        local eol = find(raw, "[\r\n]", pos) or len + 1
+        if eol > pos then
+            n = n + 1
+            if n > cap then
+                break
             end
-            if name == "user-agent" and not ua then
-                ua = value
-            elseif name == "accept-language" and not lang then
-                lang = value
-            elseif name == "cookie" then
-                if _M.foreign_cookie(value) then
-                    cookie = true
+            local colon = find(raw, ":", pos, true)
+            if colon and colon > pos and colon < eol then
+                local code = CODE[lower(sub(raw, pos, colon - 1))]
+                if code then
+                    if not seen[code] then
+                        seen[code] = true
+                        order[#order + 1] = code
+                    end
+                    if (code == "u" and not ua) or (code == "l" and not lang)
+                        or (code == "c" and not cookie)
+                    then
+                        local vs = find(raw, "[^ \t\v\f]", colon + 1) or eol
+                        if vs > eol then
+                            vs = eol
+                        end
+                        local value = sub(raw, vs, eol - 1)
+                        if code == "u" then
+                            ua = value
+                        elseif code == "l" then
+                            lang = value
+                        elseif _M.foreign_cookie(value) then
+                            cookie = true
+                        end
+                    end
                 end
             end
         end
+        pos = eol + 1
     end
-    return {
-        ordered = true,
-        order = table.concat(order),
-        ua = ua,
-        lang = lang,
-        cookie = cookie and true or false,
-    }
+    out = out or {}
+    out.ordered = true
+    out.order = table.concat(order)
+    out.ua = ua
+    out.lang = lang
+    out.cookie = cookie and true or false
+    return out
 end
 
 function _M.short(key)
@@ -206,7 +230,9 @@ function _M.capture()
     end
     local fields
     if ver > 0 and ver < 2 then
-        fields = _M.parse_raw(ngx.req.raw_header(true), _M.CAP)
+        fields = fields_buf
+        clear(fields)
+        _M.parse_raw(ngx.req.raw_header(true), _M.CAP, fields)
     else
         local h = ngx.req.get_headers(_M.CAP) or {}
         fields = {
