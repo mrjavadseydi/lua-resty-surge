@@ -1,11 +1,13 @@
 package = "lua-resty-surge"
 version = "0.1.0-1"
--- Replace this with the published repository before `luarocks upload`.
 source = {
-    url = "git://localhost/lua-resty-surge.git",
+    url = "git+https://github.com/mrjavadseydi/lua-resty-surge.git",
+    tag = "v0.1.0",
 }
 description = {
     summary = "Adaptive L7 surge detection for OpenResty",
+    detailed = "Tells an L7 flood apart from a busy hour, blocks only the attacking sources, and logs a readable reason for every decision.",
+    homepage = "https://github.com/mrjavadseydi/lua-resty-surge",
     license = "MIT",
 }
 dependencies = {
