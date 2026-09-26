@@ -42,6 +42,9 @@ http {
             -- gcra_burst 100 so a per-worker burst (2 x 100) would show.
             advanced = { test_hooks = true, tick = 0.25, pow_bits = 8, gcra_burst = 100 },
             export_path = "$prefix/export/blocks.txt",
+            on_decision = function(d)
+                ngx.log(ngx.WARN, "surge-hook: ", d.action, " ", d.target, " ", d.reason)
+            end,
         })
     }
 
@@ -136,6 +139,12 @@ echo "$body" | grep -q ok || fail "body was not ok: $body" "$PREFIX"
 
 status=$(curl -sf "http://127.0.0.1:$PORT/_surge") || fail "status" "$PREFIX"
 echo "$status" | grep -q '"mode":"normal"' || fail "status mode: $status" "$PREFIX"
+echo "$status" | grep -q '"decisions":\[\]' || fail "empty decisions is not []: $status" "$PREFIX"
+
+page=$(curl -sf -D - "http://127.0.0.1:$PORT/_surge?format=html") || fail "dashboard" "$PREFIX"
+echo "$page" | grep -qi "Content-Type: text/html" || fail "dashboard type" "$PREFIX"
+echo "$page" | grep -qi "Content-Security-Policy: default-src 'none'" || fail "dashboard csp" "$PREFIX"
+echo "$page" | grep -q "<title>surge status</title>" || fail "dashboard body" "$PREFIX"
 
 curl -sf "http://127.0.0.1:$PORT/_block" | grep -q published || fail "publish" "$PREFIX"
 sleep 0.8
@@ -191,6 +200,9 @@ s=$(curl -sf "http://127.0.0.1:$PORT/_surge")
 echo "$s" | grep -q '"target":"127.0.0.1"' || fail "status target: $s" "$PREFIX"
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
 [ "$code" = "403" ] || fail "block by address did not apply ($code)" "$PREFIX"
+# A queued block is a new decision: one log line and one on_decision call.
+grep -q "surge-hook: block 127.0.0.1 manual" "$PREFIX/logs/error.log" \
+    || fail "on_decision not called for a queued block" "$PREFIX"
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" | grep -q unblock \
     || fail "unblock by address" "$PREFIX"
 sleep 0.8
@@ -255,6 +267,10 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.
 curl -sf "http://127.0.0.1:$PORT/_surge" | grep -q '"reason":"challenge_ignored"' \
     || fail "block reason missing from status" "$PREFIX"
 grep -q "^v4 32 127.0.0.1 " "$PREFIX/export/blocks.txt" || fail "block not exported" "$PREFIX"
+grep -q "surge: Blocked 127.0.0.1: ignored the challenge page" "$PREFIX/logs/error.log" \
+    || fail "challenge_ignored block not logged" "$PREFIX"
+grep -q "surge-hook: block 127.0.0.1 challenge_ignored" "$PREFIX/logs/error.log" \
+    || fail "on_decision not called for challenge_ignored" "$PREFIX"
 # The script path is not a way around a block while a challenge is live.
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
     "http://127.0.0.1:$PORT/.srg-pow.v1.js" || true)

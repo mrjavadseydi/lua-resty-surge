@@ -340,16 +340,45 @@ function log_window()
     end
 end
 
-local function log_decisions(prev, list)
-    local old = {}
-    for i = 1, #(prev or {}) do
-        local r = prev[i]
-        old[r.incident or ""] = r.action
+-- What status() shows for one decision, and what on_decision receives.
+local function view_of(r, now)
+    return {
+        incident = r.incident,
+        action = r.action,
+        reason = r.reason,
+        target = (r.family == "fp" and fingerprint.short(r.key))
+            or (r.family == "host" and r.key)
+            or messages.label(r.key or "", r.bits),
+        uri = r.uri,
+        message = r.message,
+        ttl = r.ttl,
+        expires_in = r.until_ts and math.max(0, math.floor(r.until_ts - now)) or nil,
+    }
+end
+
+local function actions_of(list)
+    local out = {}
+    for i = 1, #(list or {}) do
+        local r = list[i]
+        out[r.incident or ""] = r.action
     end
+    return out
+end
+
+-- `old` is actions_of() the list before this tick. A new or changed
+-- decision gets one log line and one on_decision call, on the leader.
+local function log_decisions(old, list)
+    local now = ngx.now()
     for i = 1, #list do
         local r = list[i]
         if r.action ~= "observe" and old[r.incident or ""] ~= r.action then
             ngx.log(ngx.NOTICE, "surge: ", r.message or r.action or "")
+            if cfg.on_decision then
+                local ok, err = pcall(cfg.on_decision, view_of(r, now))
+                if not ok then
+                    ngx.log(ngx.ERR, "surge: on_decision failed: ", err)
+                end
+            end
         end
     end
 end
@@ -577,6 +606,9 @@ end
 
 on_merged = function(merged)
     maybe_rotate_secret(ngx.now())
+    -- Before apply_ops: it appends queued blocks to box.list in place, and
+    -- they must still count as new below.
+    local old = actions_of(box.list)
     apply_ops(ngx.now())
     -- Another leader may have saved a newer clock while this worker waited
     -- on the lease. Continue from that snapshot instead of overwriting it.
@@ -611,7 +643,7 @@ on_merged = function(merged)
         box.mode = bench_mode
         box.sample = sample_of(bench_mode)
     elseif snap_sig ~= sig then
-        log_decisions(box.list, snap.list)
+        log_decisions(old, snap.list)
         publish(snap, snap_sig)
     end
     box.rps = snap.rps
@@ -1459,6 +1491,13 @@ function _M.early()
 end
 
 function _M.status()
+    if ngx.var.arg_format == "html" then
+        local dashboard = require "resty.surge.dashboard"
+        ngx.header["Content-Type"] = "text/html; charset=utf-8"
+        ngx.header["Content-Security-Policy"] = dashboard.CSP
+        ngx.print(dashboard.HTML)
+        return
+    end
     ngx.header["Content-Type"] = "application/json"
     if not started or not box then
         ngx.status = 500
@@ -1527,22 +1566,11 @@ function _M.status()
     end
 
     local now = ngx.now()
-    local view = {}
+    -- array_mt: no decisions is [], not {}. Clients iterate it.
+    local view = setmetatable({}, cjson.array_mt)
     local list = box.list or {}
     for i = 1, #list do
-        local r = list[i]
-        view[i] = {
-            incident = r.incident,
-            action = r.action,
-            reason = r.reason,
-            target = (r.family == "fp" and fingerprint.short(r.key))
-                or (r.family == "host" and r.key)
-                or messages.label(r.key or "", r.bits),
-            uri = r.uri,
-            message = r.message,
-            ttl = r.ttl,
-            expires_in = r.until_ts and math.max(0, math.floor(r.until_ts - now)) or nil,
-        }
+        view[i] = view_of(list[i], now)
     end
     local st = dict and cjson.decode(dict:get("stat") or "null")
     if type(st) ~= "table" then

@@ -20,6 +20,7 @@ build = {
         ["resty.surge.challenge"] = "lib/resty/surge/challenge.lua",
         ["resty.surge.clientip"] = "lib/resty/surge/clientip.lua",
         ["resty.surge.config"] = "lib/resty/surge/config.lua",
+        ["resty.surge.dashboard"] = "lib/resty/surge/dashboard.lua",
         ["resty.surge.decisions"] = "lib/resty/surge/decisions.lua",
         ["resty.surge.entropy"] = "lib/resty/surge/entropy.lua",
         ["resty.surge.escalation"] = "lib/resty/surge/escalation.lua",

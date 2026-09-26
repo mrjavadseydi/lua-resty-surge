@@ -35,6 +35,20 @@ location = /_surge {
 
 `GET /_surge?format=prometheus` is the same data as text. Labels are `result` and `reason` only. Addresses are not labels.
 
+`GET /_surge?format=html` is a small dashboard: mode, request rate against the baseline, and the live decisions with a Remove button (the same `unblock` POST). It polls the JSON every 2s and loads nothing from outside. It is behind the same `allow`/`deny` as the location.
+
+`on_decision` is called once for each new or changed decision, on the leader, with the same fields a decision has in the JSON. It runs in a timer, so it can make HTTP calls. For example, to post to a Slack webhook with `lua-resty-http`:
+
+```lua
+on_decision = function(d)
+    require("resty.http").new():request_uri(SLACK_WEBHOOK, {
+        method = "POST",
+        headers = { ["Content-Type"] = "application/json" },
+        body = require("cjson").encode({ text = "surge: " .. d.message }),
+    })
+end,
+```
+
 Each decision lists its `target` (address, CIDR, or fingerprint id) and `expires_in` seconds. Every worker answers with the same rate and baseline numbers.
 
 `POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident or address>` update the manual list. Unblock takes the incident id or the exact address or CIDR of a decision (`1.2.3.0/24` for a subnet block). Both are queued for the leader and take effect within one tick.

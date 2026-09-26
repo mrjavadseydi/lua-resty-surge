@@ -90,6 +90,9 @@ function _M.parse(opts)
     if opts.on_block ~= nil and type(opts.on_block) ~= "function" then
         error("surge: on_block must be a function")
     end
+    if opts.on_decision ~= nil and type(opts.on_decision) ~= "function" then
+        error("surge: on_decision must be a function")
+    end
 
     local allow4, allow6, paths = {}, {}, {}
     if opts.allow ~= nil then
@@ -190,6 +193,7 @@ function _M.parse(opts)
         expose = expose,
         dry_run = opts.dry_run and true or false,
         on_block = opts.on_block,
+        on_decision = opts.on_decision,
         allow4 = allow4,
         allow6 = allow6,
         paths = paths,
