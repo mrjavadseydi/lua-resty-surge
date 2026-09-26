@@ -41,6 +41,7 @@ local state
 local box
 local allow4, allow6, allow_paths
 local sample_n = 0
+local seen_n = 0
 local sig = ""
 local baseline_saved = ""
 local shared
@@ -365,8 +366,49 @@ local function actions_of(list)
     return out
 end
 
+-- on_decision may yield (HTTP, sleep). It runs in its own timer so a slow
+-- hook cannot hold on_merged open while a later tick publishes, then
+-- resume and publish its older snapshot over the newer one.
+-- ponytail: one drain timer, queue capped at NOTIFY_MAX; excess is dropped.
+local NOTIFY_MAX = 256
+local notify_q = {}
+local notify_head, notify_tail = 1, 0
+local notify_busy = false
+
+local function drain_notify()
+    while notify_head <= notify_tail do
+        local v = notify_q[notify_head]
+        notify_q[notify_head] = nil
+        notify_head = notify_head + 1
+        local ok, err = pcall(cfg.on_decision, v)
+        if not ok then
+            ngx.log(ngx.ERR, "surge: on_decision failed: ", err)
+        end
+    end
+    notify_head, notify_tail = 1, 0
+    notify_busy = false
+end
+
+local function notify(view)
+    if notify_tail - notify_head + 1 >= NOTIFY_MAX then
+        log.limited("notify_full", ngx.WARN, "surge: on_decision queue full, dropped")
+        return
+    end
+    notify_tail = notify_tail + 1
+    notify_q[notify_tail] = view
+    if not notify_busy then
+        local ok, err = ngx.timer.at(0, drain_notify)
+        if ok then
+            notify_busy = true
+        else
+            ngx.log(ngx.ERR, "surge: on_decision timer failed: ", err or "")
+        end
+    end
+end
+
 -- `old` is actions_of() the list before this tick. A new or changed
 -- decision gets one log line and one on_decision call, on the leader.
+-- Called after publish(), so a hook never sees a decision that failed to publish.
 local function log_decisions(old, list)
     local now = ngx.now()
     for i = 1, #list do
@@ -374,10 +416,7 @@ local function log_decisions(old, list)
         if r.action ~= "observe" and old[r.incident or ""] ~= r.action then
             ngx.log(ngx.NOTICE, "surge: ", r.message or r.action or "")
             if cfg.on_decision then
-                local ok, err = pcall(cfg.on_decision, view_of(r, now))
-                if not ok then
-                    ngx.log(ngx.ERR, "surge: on_decision failed: ", err)
-                end
+                notify(view_of(r, now))
             end
         end
     end
@@ -643,8 +682,9 @@ on_merged = function(merged)
         box.mode = bench_mode
         box.sample = sample_of(bench_mode)
     elseif snap_sig ~= sig then
-        log_decisions(old, snap.list)
-        publish(snap, snap_sig)
+        if publish(snap, snap_sig) then
+            log_decisions(old, snap.list)
+        end
     end
     box.rps = snap.rps
     box.mean = snap.mean
@@ -737,6 +777,9 @@ local function host_key()
 end
 
 local function observe(family, bin, fp_key)
+    -- Every request that reaches the sketches, whatever its outcome. A
+    -- site-challenged flood is counted here, not in stats_allowed.
+    seen_n = seen_n + 1
     sample_n = sample_n + 1
     local mod = box.sample
     if mod > 1 and sample_n < mod then
@@ -1251,14 +1294,13 @@ local function on_tick(premature)
     end
     maybe_reload_feeds()
     load_secrets()
-    -- Requests that reached observe() this tick, before flush clears them.
-    local seen = stats_allowed
+    local seen = seen_n
+    seen_n = 0
     flush_stats()
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
     end
-    -- After the flush, so the window just sent was counted at one interval.
     load_sample = math.floor(seen / SAMPLE_TARGET)
     if box then
         box.sample = sample_of(box.mode)

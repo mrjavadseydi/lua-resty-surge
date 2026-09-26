@@ -43,6 +43,8 @@ http {
             advanced = { test_hooks = true, tick = 0.25, pow_bits = 8, gcra_burst = 100 },
             export_path = "$prefix/export/blocks.txt",
             on_decision = function(d)
+                -- A slow hook. It must not undo a block published meanwhile.
+                if d.target == "127.0.0.9" then ngx.sleep(1.5) end
                 ngx.log(ngx.WARN, "surge-hook: ", d.action, " ", d.target, " ", d.reason)
             end,
         })
@@ -208,6 +210,16 @@ curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" | grep -q unb
 sleep 0.8
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
 [ "$code" = "200" ] || fail "unblock by address did not clear ($code)" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.9&ttl=60" >/dev/null
+sleep 0.5
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.10&ttl=60" >/dev/null
+sleep 2.5
+s=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+echo "$s" | grep -q '"target":"127.0.0.10"' || fail "slow on_decision undid a block: $s" "$PREFIX"
+grep -q "surge-hook: block 127.0.0.9 manual" "$PREFIX/logs/error.log" \
+    || fail "slow on_decision not called" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.9" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.10" >/dev/null
 
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6
