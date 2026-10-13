@@ -29,7 +29,7 @@ local metrics = require "resty.surge.metrics"
 local messages = require "resty.surge.messages"
 local cjson = require "cjson.safe"
 
-local _M = { _VERSION = "0.1.0" }
+local _M = { _VERSION = "0.1.1" }
 
 local agent_on = false
 local an
