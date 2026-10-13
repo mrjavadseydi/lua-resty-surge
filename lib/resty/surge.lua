@@ -369,39 +369,46 @@ end
 -- on_decision may yield (HTTP, sleep). It runs in its own timer so a slow
 -- hook cannot hold on_merged open while a later tick publishes, then
 -- resume and publish its older snapshot over the newer one.
--- ponytail: one drain timer, queue capped at NOTIFY_MAX; excess is dropped.
+-- one drain timer, hooks run one at a time, queue capped at
+-- NOTIFY_MAX; excess is dropped. A hook per timer if one slow hook must not
+-- delay the rest.
 local NOTIFY_MAX = 256
 local notify_q = {}
-local notify_head, notify_tail = 1, 0
 local notify_busy = false
 
 local function drain_notify()
-    while notify_head <= notify_tail do
-        local v = notify_q[notify_head]
-        notify_q[notify_head] = nil
-        notify_head = notify_head + 1
-        local ok, err = pcall(cfg.on_decision, v)
-        if not ok then
-            ngx.log(ngx.ERR, "surge: on_decision failed: ", err)
+    while #notify_q > 0 do
+        local q = notify_q
+        notify_q = {}
+        for i = 1, #q do
+            -- On reload the new leader takes over. Do not hold this worker open.
+            if ngx.worker.exiting() then
+                notify_busy = false
+                return
+            end
+            -- expires_in as of delivery, not as of queueing.
+            local ok, err = pcall(cfg.on_decision, view_of(q[i], ngx.now()))
+            if not ok then
+                ngx.log(ngx.ERR, "surge: on_decision failed: ", err)
+            end
         end
     end
-    notify_head, notify_tail = 1, 0
     notify_busy = false
 end
 
-local function notify(view)
-    if notify_tail - notify_head + 1 >= NOTIFY_MAX then
+local function notify(r)
+    if #notify_q >= NOTIFY_MAX then
         log.limited("notify_full", ngx.WARN, "surge: on_decision queue full, dropped")
         return
     end
-    notify_tail = notify_tail + 1
-    notify_q[notify_tail] = view
+    notify_q[#notify_q + 1] = r
     if not notify_busy then
         local ok, err = ngx.timer.at(0, drain_notify)
         if ok then
             notify_busy = true
         else
-            ngx.log(ngx.ERR, "surge: on_decision timer failed: ", err or "")
+            notify_q[#notify_q] = nil
+            ngx.log(ngx.ERR, "surge: on_decision timer failed, dropped: ", err or "")
         end
     end
 end
@@ -410,13 +417,12 @@ end
 -- decision gets one log line and one on_decision call, on the leader.
 -- Called after publish(), so a hook never sees a decision that failed to publish.
 local function log_decisions(old, list)
-    local now = ngx.now()
     for i = 1, #list do
         local r = list[i]
         if r.action ~= "observe" and old[r.incident or ""] ~= r.action then
             ngx.log(ngx.NOTICE, "surge: ", r.message or r.action or "")
             if cfg.on_decision then
-                notify(view_of(r, now))
+                notify(r)
             end
         end
     end
@@ -571,7 +577,7 @@ local function apply_ops(now)
     local list = box.list or {}
     local changed = false
     local blocked
-    -- ponytail: every challenge_ignored block rides in the one decision blob
+    -- every challenge_ignored block rides in the one decision blob
     -- (~150 B each), so they stop at MAX_IGNORED. Past that an address just
     -- keeps getting the page. Give them their own blob if that bites.
     local room
@@ -643,11 +649,16 @@ local function apply_ops(now)
     end
 end
 
-on_merged = function(merged)
+-- Actions before a publish that failed. apply_ops already put its blocks in
+-- box.list, so the next tick compares against this instead and still reports them.
+local unpublished_old
+local merging = false
+
+local function merge(merged)
     maybe_rotate_secret(ngx.now())
     -- Before apply_ops: it appends queued blocks to box.list in place, and
     -- they must still count as new below.
-    local old = actions_of(box.list)
+    local old = unpublished_old or actions_of(box.list)
     apply_ops(ngx.now())
     -- Another leader may have saved a newer clock while this worker waited
     -- on the lease. Continue from that snapshot instead of overwriting it.
@@ -683,7 +694,10 @@ on_merged = function(merged)
         box.sample = sample_of(bench_mode)
     elseif snap_sig ~= sig then
         if publish(snap, snap_sig) then
+            unpublished_old = nil
             log_decisions(old, snap.list)
+        else
+            unpublished_old = old
         end
     end
     box.rps = snap.rps
@@ -709,6 +723,20 @@ on_merged = function(merged)
         else
             ngx.log(ngx.ERR, "surge: baseline save failed: ", berr or "")
         end
+    end
+end
+
+-- timer.every starts a tick even while the last one runs. If merge ever
+-- yields, an older tick could resume and publish over a newer one; skip instead.
+on_merged = function(merged)
+    if merging then
+        return
+    end
+    merging = true
+    local ok, err = xpcall(merge, debug.traceback, merged)
+    merging = false
+    if not ok then
+        error(err, 0)
     end
 end
 
@@ -860,7 +888,7 @@ end
 -- a browser's fetch, image or script (Sec-Fetch-Dest set, not "document")
 -- cannot run the page, so it is not ignoring it. A solve takes one back,
 -- so a NAT of real users solving does not add up to a block.
--- ponytail: a bot that sends Sec-Fetch-Dest: empty is never counted. It
+-- a bot that sends Sec-Fetch-Dest: empty is never counted. It
 -- still only ever gets the page; the block just saves the bytes.
 local function note_page(bin)
     local limit = cfg.params.chal_ignore
@@ -924,7 +952,7 @@ end
 -- One GCRA per decision in the shared dict, so the rate and the burst are
 -- the node's. Per worker, a client on every worker got workers x burst,
 -- and one pinned to a single worker got rate / workers.
--- ponytail: one hot shm key per decision. No measurable cost at 2 workers
+-- one hot shm key per decision. No measurable cost at 2 workers
 -- (make bench-cost, site limit row). Per-worker GCRA with burst / workers
 -- if many workers contend on it.
 local function limit_denied(dec)

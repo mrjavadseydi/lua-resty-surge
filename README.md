@@ -37,7 +37,7 @@ location = /_surge {
 
 `GET /_surge?format=html` is a small dashboard: mode, request rate against the baseline, and the live decisions with a Remove button (the same `unblock` POST). It polls the JSON every 2s and loads nothing from outside. It is behind the same `allow`/`deny` as the location.
 
-`on_decision` is called once for each new or changed decision, on the leader, with the same fields a decision has in the JSON. It runs in a timer, so it can make HTTP calls. For example, to post to a Slack webhook with `lua-resty-http`:
+`on_decision` is called once for each new or changed decision, on the leader, with the same fields a decision has in the JSON. It runs in a timer, so it can make HTTP calls. Hooks run one at a time and at most 256 wait, so give HTTP calls a short timeout. A hook that hangs delays every alert after it. For example, to post to a Slack webhook with `lua-resty-http`:
 
 ```lua
 on_decision = function(d)

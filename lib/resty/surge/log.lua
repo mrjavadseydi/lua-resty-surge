@@ -12,7 +12,7 @@ function _M.limited(key, level, msg)
     end
     if not prev then
         n = n + 1
-        -- ponytail: keys are incident ids; wipe instead of LRU. Worst case is
+        -- keys are incident ids; wipe instead of LRU. Worst case is
         -- one extra line per key after a wipe.
         if n > 1024 then
             last, n = {}, 1

@@ -210,14 +210,23 @@ curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" | grep -q unb
 sleep 0.8
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
 [ "$code" = "200" ] || fail "unblock by address did not clear ($code)" "$PREFIX"
+# Block .10 while the 1.5s hook for .9 is still sleeping.
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.9&ttl=60" >/dev/null
-sleep 0.5
+i=0
+until curl -sf "http://127.0.0.1:$PORT/_surge" | grep -q '"target":"127.0.0.9"'; do
+    i=$((i + 1)); [ "$i" -lt 20 ] || fail ".9 block not published" "$PREFIX"
+    sleep 0.1
+done
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.10&ttl=60" >/dev/null
-sleep 2.5
+i=0
+until grep -q "surge-hook: block 127.0.0.9 manual" "$PREFIX/logs/error.log"; do
+    i=$((i + 1)); [ "$i" -lt 50 ] || fail "slow on_decision not called" "$PREFIX"
+    sleep 0.1
+done
+sleep 0.5
 s=$(curl -sf "http://127.0.0.1:$PORT/_surge")
 echo "$s" | grep -q '"target":"127.0.0.10"' || fail "slow on_decision undid a block: $s" "$PREFIX"
-grep -q "surge-hook: block 127.0.0.9 manual" "$PREFIX/logs/error.log" \
-    || fail "slow on_decision not called" "$PREFIX"
+echo "$s" | grep -q '"target":"127.0.0.9"' || fail "slow on_decision lost its own block: $s" "$PREFIX"
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.9" >/dev/null
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.10" >/dev/null
 
