@@ -22,6 +22,10 @@ function _M.new_trie()
     return node()
 end
 
+local function manual_block(dec)
+    return type(dec) == "table" and dec.manual and (dec.action == "block" or dec.close)
+end
+
 local function add_partial(n, bits, key, dec)
     local full = math.floor(bits / 8)
     local rem = bits % 8
@@ -37,9 +41,7 @@ end
 
 function _M.insert(root, key, bits, dec)
     if bits <= 0 then
-        root.decision = dec
-        root.bits = 0
-        return
+        bits = 0
     end
     local full = math.floor(bits / 8)
     local n = root
@@ -53,7 +55,12 @@ function _M.insert(root, key, bits, dec)
         n = child
     end
     if bits % 8 == 0 then
-        n.decision = dec
+        -- Keep both so rejecting a scoped manual block preserves the fallback.
+        if manual_block(dec) then
+            n.manual = dec
+        else
+            n.decision = dec
+        end
         n.bits = bits
     else
         add_partial(n, bits, key, dec)
@@ -62,9 +69,14 @@ end
 
 -- `accept(dec)` is false for a URI-scoped decision that does not apply.
 -- A shorter unscoped match is kept when a longer scoped one does not apply.
+-- An accepted manual block wins over every automatic decision.
 function _M.lookup(root, bin, accept)
     local n = root
     local best, best_bits = nil, -1
+    local best_manual, manual_bits = nil, -1
+    if n.manual and accept(n.manual) then
+        best_manual, manual_bits = n.manual, n.bits or 0
+    end
     if n.decision and accept(n.decision) then
         best, best_bits = n.decision, n.bits or 0
     end
@@ -74,26 +86,34 @@ function _M.lookup(root, bin, accept)
         if parts then
             for p = 1, #parts do
                 local rule = parts[p]
+                local manual = manual_block(rule.dec)
+                local seen_bits = manual and manual_bits or best_bits
                 if band(b, rule.mask) == rule.value
-                    and rule.bits > best_bits
+                    and rule.bits > seen_bits
                     and accept(rule.dec)
                 then
-                    best = rule.dec
-                    best_bits = rule.bits
+                    if manual then
+                        best_manual, manual_bits = rule.dec, rule.bits
+                    else
+                        best, best_bits = rule.dec, rule.bits
+                    end
                 end
             end
         end
         local child = n.kids[b]
         if not child then
-            return best
+            return best_manual or best
         end
         n = child
+        if n.manual and n.bits > manual_bits and accept(n.manual) then
+            best_manual, manual_bits = n.manual, n.bits
+        end
         if n.decision and n.bits > best_bits and accept(n.decision) then
             best = n.decision
             best_bits = n.bits
         end
     end
-    return best
+    return best_manual or best
 end
 
 function _M.build(list)

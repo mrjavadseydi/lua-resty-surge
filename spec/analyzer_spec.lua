@@ -115,6 +115,31 @@ local function sites(victim_count)
 end
 
 describe("analyzer", function()
+    it("does not challenge steady sites after an empty startup tick", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local ctx = analyzer.new(p)
+        analyzer.run(ctx, empty(), 1000)
+        local snap
+        for i = 1, 500 do
+            snap = analyzer.run(ctx, sites(10), 1000 + i * p.tick,
+                snap and snap.list)
+            assert(snap.mode == "normal", "steady sites entered " .. snap.mode)
+            assert(#snap.list == 0, "steady sites received a decision")
+        end
+        assert(not snap.warming)
+        assert(snap.mean > 1000, "baseline stayed near zero: " .. snap.mean)
+    end)
+
+    it("still applies the warmup hard cap when first traffic arrives late", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local ctx = analyzer.new(p)
+        analyzer.run(ctx, empty(), 1000)
+        analyzer.run(ctx, empty(), 1000 + p.warmup + 1)
+        local snap = analyzer.run(ctx, flood(), 1000 + p.warmup + 2)
+        assert(snap.warming, "idle time used up calibration warmup")
+        assert(find(snap.list, attacker, "limit"), "first flood missed the hard cap")
+    end)
+
     it("challenges the flooded site, never blocks it, and leaves the others", function()
         local ctx = analyzer.new(params())
         local now = 0

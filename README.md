@@ -53,6 +53,8 @@ Each decision lists its `target` (address, CIDR, or fingerprint id) and `expires
 
 `POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident or address>` update the manual list. Unblock takes the incident id or the exact address or CIDR of a decision (`1.2.3.0/24` for a subnet block). Both are queued for the leader and take effect within one tick.
 
+Manual blocks take precedence over automatic decisions for overlapping networks.
+
 ## Behind a CDN or load balancer
 
 If every request comes from the proxy, the module will treat the proxy as the attacker. Prefer nginx `real_ip`, which rewrites the address `protect()` already reads. Or set `trusted_proxies` to the proxy CIDRs. The client is then the rightmost untrusted hop in `X-Forwarded-For` (or `client_header`), looking at only the last eight hops.

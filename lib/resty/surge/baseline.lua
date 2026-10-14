@@ -10,11 +10,11 @@
 -- While the mode is elevated or attack the average is frozen, otherwise a
 -- long flood slowly becomes "normal".
 --
--- In normal mode a positive step is clamped to
+-- After warmup, in normal mode a positive step is clamped to
 -- mean * max_growth_per_hour * tick/3600. A ramp of a couple of percent a
 -- minute then cannot hide inside the average. Organic growth still crosses
 -- into elevated; that mode only counts more, it does not block anyone.
--- The first sample sets the mean with no clamp, so a cold process is not
+-- The first nonzero sample sets the mean with no clamp, so a cold process is not
 -- stuck at zero.
 
 local exp = math.exp
@@ -57,6 +57,9 @@ end
 
 local function apply_ewma(b, r)
     if not b.seeded then
+        if r <= 0 then
+            return
+        end
         b.mean = r
         b.var = 0
         b.seeded = true
@@ -65,7 +68,7 @@ local function apply_ewma(b, r)
 
     local diff = r - b.mean
     local incr = b.alpha * diff
-    if incr > 0 and b.mean > 0 then
+    if incr > 0 and b.mean > 0 and not b.warming then
         local cap = b.mean * b.max_growth_per_hour * (b.tick / 3600)
         if incr > cap then
             incr = cap
@@ -87,7 +90,8 @@ function _M.lines(b)
 end
 
 function _M.update(b, rps, now, entropy_attack)
-    if b.started_at == nil then
+    -- Idle startup time cannot consume the first traffic's calibration window.
+    if b.started_at == nil or (not b.seeded and rps > 0) then
         b.started_at = now
     end
 
@@ -217,6 +221,10 @@ function _M.restore(b, snap, now)
     b.seeded = snap.seeded
     if b.seeded == nil then
         b.seeded = (b.mean ~= 0) or (b.var ~= 0)
+    end
+    -- Older snapshots may have seeded the empty startup window.
+    if b.mean == 0 and b.var == 0 then
+        b.seeded = false
     end
     b.updated_at = snap.updated_at
 

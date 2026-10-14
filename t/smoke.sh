@@ -88,6 +88,24 @@ http {
             }
         }
 
+        location = /_overlap {
+            content_by_lua_block {
+                local ok, err = require("resty.surge")._publish({
+                    { cidr = "127.0.0.0/24", action = "block", reason = "manual" },
+                    { cidr = "127.0.0.1/32", action = "limit",
+                      reason = "heavy_hitter", manual = false },
+                })
+                if ok then
+                    local ch = require "resty.surge.challenge"
+                    local d = ngx.shared.surge
+                    local value = ch.issue(ngx.var.binary_remote_addr, ngx.now(),
+                        120, 8, d:get("pow:ver"), d:get("pow:cur"))
+                    ngx.header["Set-Cookie"] = ch.cookie_header(value, 120, false)
+                end
+                ngx.say(ok and "published" or err)
+            }
+        }
+
         location = /_host {
             content_by_lua_block {
                 local ok, err = require("resty.surge")._publish({
@@ -168,6 +186,26 @@ page=$(curl -sf -D - "http://127.0.0.1:$PORT/_surge?format=html") || fail "dashb
 echo "$page" | grep -qi "Content-Type: text/html" || fail "dashboard type" "$PREFIX"
 echo "$page" | grep -qi "Content-Security-Policy: default-src 'none'" || fail "dashboard csp" "$PREFIX"
 echo "$page" | grep -q "<title>surge status</title>" || fail "dashboard body" "$PREFIX"
+
+# A solved cookie cannot bypass a manual /24 through an automatic /32 limit.
+hdr=$(curl -sf -D - "http://127.0.0.1:$PORT/_overlap") || fail "overlap publish" "$PREFIX"
+cookie=$(printf '%s\n' "$hdr" | awk 'tolower($1)=="set-cookie:" { print $2 }' \
+    | tr -d '\r' | cut -d';' -f1)
+echo "$cookie" | grep -q '^srg_pow=' || fail "overlap cookie missing" "$PREFIX"
+sleep 0.8
+i=0
+while [ "$i" -lt 20 ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $cookie" \
+        "http://127.0.0.1:$PORT/overlap")
+    [ "$code" = "403" ] || fail "automatic rule hid the manual network block ($code)" "$PREFIX"
+    i=$((i + 1))
+done
+curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || fail "overlap path allow" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.0/24" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" >/dev/null
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
+[ "$code" = "200" ] || fail "overlap unblock did not clear ($code)" "$PREFIX"
 
 curl -sf "http://127.0.0.1:$PORT/_block" | grep -q published || fail "publish" "$PREFIX"
 sleep 0.8

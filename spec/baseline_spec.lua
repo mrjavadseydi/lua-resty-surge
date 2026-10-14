@@ -118,6 +118,45 @@ describe("ewma baseline", function()
         assert(b.warming == true)
     end)
 
+    it("calibrates steady traffic after an empty startup window", function()
+        local b = new_b({
+            tick = 0.25, half_life = 600, warmup = 120,
+            min_rps = 100, max_growth_per_hour = 1,
+        })
+        assert(baseline.update(b, 0, 1000, false) == "normal")
+        assert(not b.seeded, "empty traffic seeded the baseline")
+        for i = 1, 500 do
+            local mode = baseline.update(b, 1000, 1000 + i * b.tick, false)
+            assert(mode == "normal", "steady traffic entered " .. mode)
+        end
+        assert(math.abs(b.mean - 1000) < 1e-6, "mean " .. b.mean)
+        assert(baseline.update(b, 100000, 1126, false) == "attack")
+        assert(math.abs(b.mean - 1000) < 1e-6, "attack changed calibration")
+    end)
+
+    it("learns rising traffic during warmup without the hourly cap", function()
+        local b = new_b({
+            half_life = 1, warmup = 10, min_rps = 100,
+            max_growth_per_hour = 1,
+        })
+        baseline.update(b, 100, 0, false)
+        baseline.update(b, 1000, 1, false)
+        assert(b.mean > 600, "warmup growth was capped: " .. b.mean)
+        for i = 2, 10 do
+            assert(baseline.update(b, 1000, i, false) == "normal")
+        end
+    end)
+
+    it("reseeds an imported zero baseline on its first traffic", function()
+        local b = new_b({ half_life = 600, warmup = 120, min_rps = 100 })
+        baseline.restore(b, {
+            mean = 0, var = 0, seeded = true, mode = "normal",
+            started_at = 1000, updated_at = 1000,
+        }, 1001)
+        baseline.update(b, 1000, 1001, false)
+        assert(b.mean == 1000, "zero seed kept the long EWMA: " .. b.mean)
+    end)
+
     it("ignores an entropy signal below min_rps", function()
         local b = new_b({ half_life = 100000, min_rps = 1000 })
         baseline.restore(b, {

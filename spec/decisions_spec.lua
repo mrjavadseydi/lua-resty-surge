@@ -1,4 +1,5 @@
 local decisions = require "resty.surge.decisions"
+local clientip = require "resty.surge.clientip"
 
 local function yes()
     return true
@@ -32,6 +33,73 @@ describe("decision trie", function()
         assert(decisions.lookup(root, v4(10, 1, 20, 5), accept) == net)
         assert(decisions.lookup(root, v4(10, 1, 31, 1), yes) == net)
         assert(decisions.lookup(root, v4(10, 1, 32, 1), yes) == nil)
+    end)
+
+    it("enforces manual blocks over more specific automatic decisions", function()
+        local cases = {
+            { "0.0.0.0/0", "10.1.20.5" },
+            { "10.1.16.0/20", "10.1.20.5" },
+            { "10.1.20.0/24", "10.1.20.5" },
+            { "2001:db8::/64", "2001:db8::5" },
+            { "2001:db8:8000::/33", "2001:db8:9000::5" },
+        }
+        for _, case in ipairs(cases) do
+            local net = assert(clientip.parse_cidr(case[1]))
+            local ip = assert(clientip.parse_cidr(case[2]))
+            for _, action in ipairs({ "observe", "limit", "challenge", "block" }) do
+                local manual = { family = net.v6 and "v6" or "v4", key = net.bin,
+                    bits = net.bits, action = "block", manual = true }
+                local auto = { family = ip.v6 and "v6" or "v4", key = ip.bin,
+                    bits = ip.bits, action = action }
+                local t4, t6 = decisions.build({ manual, auto })
+                assert(decisions.lookup(ip.v6 and t6 or t4, ip.bin, yes) == manual,
+                    case[1] .. " was hidden by " .. action)
+            end
+        end
+    end)
+
+    it("keeps a scoped manual block and an automatic rule at the same prefix", function()
+        for _, bits in ipairs({ 0, 20, 24 }) do
+            for _, manual_first in ipairs({ false, true }) do
+                local root = decisions.new_trie()
+                local manual = { action = "block", manual = true, uri = "/login" }
+                local auto = { action = "limit" }
+                local first, second = manual, auto
+                if not manual_first then first, second = auto, manual end
+                decisions.insert(root, v4(10, 1, 16, 0), bits, first)
+                decisions.insert(root, v4(10, 1, 16, 0), bits, second)
+                assert(decisions.lookup(root, v4(10, 1, 16, 5), yes) == manual)
+                assert(decisions.lookup(root, v4(10, 1, 16, 5), function(d)
+                    return not d.uri
+                end) == auto, "rejected scope lost the automatic fallback")
+            end
+        end
+    end)
+
+    it("keeps the longest applicable manual block and honors scope rejection", function()
+        local root = decisions.new_trie()
+        local wide = { action = "block", manual = true }
+        local scoped = { action = "block", manual = true, uri = "/login" }
+        local auto = { action = "limit" }
+        decisions.insert(root, v4(10, 1, 16, 0), 20, wide)
+        decisions.insert(root, v4(10, 1, 20, 0), 24, scoped)
+        decisions.insert(root, v4(10, 1, 20, 5), 32, auto)
+        assert(decisions.lookup(root, v4(10, 1, 20, 5), yes) == scoped)
+        assert(decisions.lookup(root, v4(10, 1, 20, 5), function(d)
+            return not d.uri
+        end) == wide)
+    end)
+
+    it("prioritizes a manual close without prioritizing other manual actions", function()
+        for _, close in ipairs({ false, true }) do
+            local root = decisions.new_trie()
+            local manual = { action = "challenge", manual = true, close = close }
+            local auto = { action = "limit" }
+            decisions.insert(root, v4(10, 1, 20, 0), 24, manual)
+            decisions.insert(root, v4(10, 1, 20, 5), 32, auto)
+            local hit = decisions.lookup(root, v4(10, 1, 20, 5), yes)
+            assert(hit == (close and manual or auto))
+        end
     end)
 end)
 
