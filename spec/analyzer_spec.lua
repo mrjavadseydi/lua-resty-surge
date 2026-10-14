@@ -115,6 +115,36 @@ local function sites(victim_count)
 end
 
 describe("analyzer", function()
+    it("does not learn empty entropy windows before delayed steady traffic", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local ctx = analyzer.new(p)
+        for i = 0, 484 do
+            analyzer.run(ctx, empty(), 1000 + i * p.tick)
+        end
+        for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
+            assert(ctx.entropy[dim]:mean() == nil, dim .. " learned empty traffic")
+        end
+
+        local traffic = empty()
+        for i = 1, 10 do
+            local ip = string.char(10, i, 0, 1)
+            traffic.i4[ip] = { count = 96 }
+            traffic.s4[ip:sub(1, 3)] = { count = 96 }
+            traffic.u["/page" .. i] = { count = 96 }
+        end
+        traffic._totals = { i4 = 960, s4 = 960, u = 960 }
+        local snap
+        for i = 1, 800 do
+            snap = analyzer.run(ctx, traffic, 1121 + i * p.tick,
+                snap and snap.list)
+            assert(snap.mode == "normal", "steady traffic entered " .. snap.mode)
+            assert(#snap.list == 0, "steady traffic received a decision")
+        end
+        assert(not snap.warming)
+        assert(ctx.entropy.s4:mean() > 0.9)
+        assert(ctx.entropy.u:mean() > 0.9)
+    end)
+
     it("does not challenge steady sites after an empty startup tick", function()
         local p = require("resty.surge.presets").copy("balanced")
         local ctx = analyzer.new(p)

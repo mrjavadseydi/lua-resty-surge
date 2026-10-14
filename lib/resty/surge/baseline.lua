@@ -15,7 +15,7 @@
 -- minute then cannot hide inside the average. Organic growth still crosses
 -- into elevated; that mode only counts more, it does not block anyone.
 -- The first nonzero sample sets the mean with no clamp, so a cold process is not
--- stuck at zero.
+-- stuck at zero. Warmup weights only the samples received, not a full half-life.
 
 local exp = math.exp
 local sqrt = math.sqrt
@@ -51,6 +51,7 @@ function _M.new(opts)
         below_since = nil,
         updated_at = nil,
         seeded = false,
+        warmup_samples = 0,
         warming = true,
     }
 end
@@ -63,11 +64,18 @@ local function apply_ewma(b, r)
         b.mean = r
         b.var = 0
         b.seeded = true
+        b.warmup_samples = 1
         return
     end
 
+    local alpha = b.alpha
+    if b.warming then
+        b.warmup_samples = b.warmup_samples + 1
+        -- Normalize away the history that has not arrived during calibration.
+        alpha = alpha / (1 - exp(-b.warmup_samples * b.tick / b.half_life))
+    end
     local diff = r - b.mean
-    local incr = b.alpha * diff
+    local incr = alpha * diff
     if incr > 0 and b.mean > 0 and not b.warming then
         local cap = b.mean * b.max_growth_per_hour * (b.tick / 3600)
         if incr > cap then
@@ -75,7 +83,7 @@ local function apply_ewma(b, r)
         end
     end
     b.mean = b.mean + incr
-    local var = (1 - b.alpha) * (b.var + diff * incr)
+    local var = (1 - alpha) * (b.var + diff * incr)
     if var < 0 then
         var = 0
     end
@@ -171,7 +179,7 @@ function _M.export(b)
     return table.concat({
         field(s.mean), field(s.var), s.mode or "normal",
         field(s.started_at), field(s.below_since), field(s.updated_at),
-        s.seeded and "1" or "0",
+        s.seeded and "1" or "0", field(s.warmup_samples),
     }, "\n")
 end
 
@@ -179,8 +187,8 @@ function _M.import(text)
     if type(text) ~= "string" then
         return nil
     end
-    local mean, var, mode, started, below, updated, seeded =
-        text:match("([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)")
+    local mean, var, mode, started, below, updated, seeded, warmup_samples =
+        text:match("([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n?([^\n]*)")
     if not mean then
         return nil
     end
@@ -198,6 +206,7 @@ function _M.import(text)
         below_since = num(below),
         updated_at = num(updated),
         seeded = seeded == "1",
+        warmup_samples = num(warmup_samples),
     }
 end
 
@@ -210,6 +219,7 @@ function _M.snapshot(b)
         below_since = b.below_since,
         updated_at = b.updated_at,
         seeded = b.seeded,
+        warmup_samples = b.warmup_samples,
     }
 end
 
@@ -226,11 +236,13 @@ function _M.restore(b, snap, now)
     if b.mean == 0 and b.var == 0 then
         b.seeded = false
     end
+    b.warmup_samples = b.seeded and (snap.warmup_samples or 1) or 0
     b.updated_at = snap.updated_at
 
     local stale = snap.updated_at ~= nil and now ~= nil
         and (now - snap.updated_at) > b.half_life
     if stale then
+        b.warmup_samples = b.seeded and 1 or 0
         b.started_at = now
         b.mode = "normal"
         b.below_since = nil

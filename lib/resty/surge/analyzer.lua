@@ -116,10 +116,10 @@ function _M.run(ctx, merged, now, previous)
     local entropy_info = {}
     local entropy_bad = false
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
-        -- Fingerprints are not sampled in normal mode. An empty window is
-        -- "no data", not entropy 0. Learning 0 makes the next real mix look
+        -- An empty window is "no data", not entropy 0.
+        -- Learning 0 makes the next real mix look
         -- like an attack, and attack then freezes that 0 forever.
-        if dim == "f" and (totals[dim] or 0) <= 0 then
+        if (totals[dim] or 0) <= 0 then
             entropy_info[dim] = {
                 h = nil, base = ctx.entropy[dim]:mean(), delta = 0,
             }

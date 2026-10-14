@@ -147,6 +147,52 @@ describe("ewma baseline", function()
         end
     end)
 
+    it("calibrates steady traffic after a small first tick", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        baseline.update(b, 64, 1000, false)
+        for i = 1, 14400 do
+            local mode = baseline.update(b, 3840, 1000 + i * p.tick, false)
+            assert(mode == "normal", "steady traffic entered " .. mode .. " at tick " .. i)
+        end
+        assert(math.abs(b.mean - 3840) < 10, "mean " .. b.mean)
+        local mean, var = b.mean, b.var
+        assert(baseline.update(b, 38400, 4601, false) == "attack")
+        assert(b.mean == mean and b.var == var, "attack changed calibration")
+    end)
+
+    it("continues warmup calibration across a reload", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        baseline.update(b, 64, 1000, false)
+        for i = 1, 240 do
+            baseline.update(b, 3840, 1000 + i * p.tick, false)
+        end
+        local restored = baseline.new(p)
+        baseline.restore(restored, assert(baseline.import(baseline.export(b))), 1060)
+        for i = 241, 500 do
+            local now = 1000 + i * p.tick
+            local mode = baseline.update(b, 3840, now, false)
+            assert(baseline.update(restored, 3840, now, false) == mode)
+            assert(math.abs(restored.mean - b.mean) < 1e-6, "reload changed the mean")
+            assert(math.abs(restored.var - b.var) < 1e-6, "reload changed the variance")
+        end
+        assert(math.abs(restored.mean - 3840) < 10, "mean " .. restored.mean)
+    end)
+
+    it("imports older baselines without a warmup sample count", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        local snap = assert(baseline.import("64\n0\nnormal\n1000\n-\n1000\n1"))
+        assert(snap.warmup_samples == nil)
+        baseline.restore(b, snap, 1000)
+        for i = 1, 500 do
+            assert(baseline.update(b, 3840, 1000 + i * p.tick, false) == "normal")
+        end
+        assert(not b.warming)
+        assert(math.abs(b.mean - 3840) < 10, "mean " .. b.mean)
+    end)
+
     it("reseeds an imported zero baseline on its first traffic", function()
         local b = new_b({ half_life = 600, warmup = 120, min_rps = 100 })
         baseline.restore(b, {
@@ -225,11 +271,13 @@ describe("ewma baseline", function()
         baseline.restore(b, {
             mean = 80, var = 4, mode = "attack", seeded = true,
             started_at = 0, updated_at = 0, below_since = 0,
+            warmup_samples = 10000,
         }, 1000)
         assert(b.mean == 80)
         assert(b.mode == "normal")
         assert(b.started_at == 1000)
         local mode = baseline.update(b, 1e9, 1010, false)
         assert(mode == "normal", mode)
+        assert(b.mean > 1e8, "stale calibration history slowed fresh samples")
     end)
 end)
