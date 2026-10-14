@@ -376,7 +376,11 @@ local NOTIFY_MAX = 256
 local notify_q = {}
 local notify_busy = false
 
-local function drain_notify()
+local function drain_notify(premature)
+    if premature or notify_busy or #notify_q == 0 then
+        return
+    end
+    notify_busy = true
     while #notify_q > 0 do
         local q = notify_q
         notify_q = {}
@@ -402,15 +406,6 @@ local function notify(r)
         return
     end
     notify_q[#notify_q + 1] = r
-    if not notify_busy then
-        local ok, err = ngx.timer.at(0, drain_notify)
-        if ok then
-            notify_busy = true
-        else
-            notify_q[#notify_q] = nil
-            ngx.log(ngx.ERR, "surge: on_decision timer failed, dropped: ", err or "")
-        end
-    end
 end
 
 -- `old` is actions_of() the list before this tick. A new or changed
@@ -1328,6 +1323,14 @@ local function on_tick(premature)
     local ok, err = xpcall(sync.tick, debug.traceback, state)
     if not ok then
         ngx.log(ngx.ERR, "surge: tick failed: ", err)
+    end
+    -- An accepted timer can be skipped at the running cap; retry each tick.
+    if not notify_busy and #notify_q > 0 then
+        local scheduled, notify_err = ngx.timer.at(0, drain_notify)
+        if not scheduled then
+            log.limited("notify_timer", ngx.ERR,
+                "surge: on_decision timer failed: " .. (notify_err or ""))
+        end
     end
     load_sample = math.floor(seen / SAMPLE_TARGET)
     if box then

@@ -34,8 +34,24 @@ events { worker_connections 1024; }
 http {
     lua_package_path "$ROOT/lib/?.lua;;";
     lua_shared_dict surge 64m;
+    lua_max_running_timers 2;
 
     init_worker_by_lua_block {
+        -- Competing timers expire before the drain after this tick publishes.
+        local analyzer = require("resty.surge.analyzer")
+        local run = analyzer.run
+        analyzer.run = function(...)
+            local snap = run(...)
+            if ngx.shared.surge:get("smoke:timer-pressure") then
+                ngx.shared.surge:delete("smoke:timer-pressure")
+                for i = 1, 2 do
+                    assert(ngx.timer.at(0, function(premature)
+                        if not premature then ngx.sleep(1) end
+                    end))
+                end
+            end
+            return snap
+        end
         require("resty.surge").start({
             allow = { "/health" },
             dry_run = $dry,
@@ -54,7 +70,12 @@ http {
         listen 127.0.0.1:$port;
 
         location = /_surge {
-            content_by_lua_block { require("resty.surge").status() }
+            content_by_lua_block {
+                if ngx.var.arg_saturate == "1" then
+                    ngx.shared.surge:set("smoke:timer-pressure", true)
+                end
+                require("resty.surge").status()
+            }
         }
 
         location = /_block {
@@ -229,6 +250,27 @@ echo "$s" | grep -q '"target":"127.0.0.10"' || fail "slow on_decision undid a bl
 echo "$s" | grep -q '"target":"127.0.0.9"' || fail "slow on_decision lost its own block: $s" "$PREFIX"
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.9" >/dev/null
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.10" >/dev/null
+
+# A drain accepted by timer.at can still be skipped at the running timer cap.
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.11&ttl=60&saturate=1" >/dev/null
+i=0
+until grep -q "surge-hook: block 127.0.0.11 manual" "$PREFIX/logs/error.log"; do
+    i=$((i + 1)); [ "$i" -lt 50 ] || fail "notification did not recover after timer saturation" "$PREFIX"
+    sleep 0.1
+done
+drain_line=$(awk '/^local function drain_notify/ { print NR }' "$ROOT/lib/resty/surge.lua")
+grep -q "surge.lua:$drain_line: 2 lua_max_running_timers are not enough" "$PREFIX/logs/error.log" \
+    || fail "timer saturation was not exercised" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.12&ttl=60" >/dev/null
+i=0
+until grep -q "surge-hook: block 127.0.0.12 manual" "$PREFIX/logs/error.log"; do
+    i=$((i + 1)); [ "$i" -lt 20 ] || fail "new notification did not arrive after recovery" "$PREFIX"
+    sleep 0.1
+done
+[ "$(grep -c 'surge-hook: block 127.0.0.11 manual' "$PREFIX/logs/error.log")" -eq 1 ] \
+    || fail "recovered notification was duplicated" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.11" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.12" >/dev/null
 
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6
