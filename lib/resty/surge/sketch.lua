@@ -5,10 +5,10 @@
 -- and every preset uses 4. Width is a power of two so the bucket is a mask,
 -- not a division.
 --
--- Two 32-bit CRCs walk the key bytes with string.byte. ffi.cast of a Lua
+-- CRC-32 and FNV-1a walk the key bytes with string.byte. ffi.cast of a Lua
 -- string allocates a cdata pointer per call, which the normal-mode budget
--- does not allow. h2 is an independent message (each byte xored with 0x5a)
--- and is forced odd so the Kirsch–Mitzenmacher step is coprime with the width.
+-- does not allow. A bytewise XOR before another CRC keeps the hashes correlated.
+-- h2 is forced odd so the double-hash step is coprime with the width.
 -- ngx.crc32_short is faster for a single hash, but a second independent
 -- digest would need another string or a second C call. One pass here wins
 -- on short keys; bench/microbench.lua is the comparison.
@@ -17,6 +17,7 @@ local ffi = require "ffi"
 local bit = require "bit"
 
 local band, bxor, rshift, bor = bit.band, bit.bxor, bit.rshift, bit.bor
+local lshift, tobit = bit.lshift, bit.tobit
 local byte = string.byte
 local exp = math.exp
 
@@ -45,7 +46,7 @@ end
 -- nbytes hashes a prefix of s (a /24 is the first 3 bytes) without
 -- allocating the prefix string.
 local function hash_pair(s, nbytes)
-    local h1, h2 = 0xffffffff, 0xffffffff
+    local h1, h2 = 0xffffffff, 2166136261
     local n = #s
     if nbytes and nbytes < n then
         n = nbytes
@@ -54,11 +55,12 @@ local function hash_pair(s, nbytes)
         local b = byte(s, i)
         local i1 = band(bxor(h1, b), 0xff) + 1
         h1 = bxor(rshift(h1, 8), crc_table[i1])
-        local i2 = band(bxor(h2, bxor(b, 0x5a)), 0xff) + 1
-        h2 = bxor(rshift(h2, 8), crc_table[i2])
+        h2 = bxor(h2, b)
+        -- 16777619 = 2^24 + 403; split to keep integer precision in doubles.
+        h2 = tobit(lshift(h2, 24) + h2 * 403)
     end
     h1 = u32(bxor(h1, 0xffffffff))
-    h2 = u32(bor(bxor(h2, 0xffffffff), 1))
+    h2 = u32(bor(h2, 1))
     return h1, h2
 end
 

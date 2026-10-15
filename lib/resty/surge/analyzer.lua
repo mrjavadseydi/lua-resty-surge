@@ -31,7 +31,7 @@ local function tracker(params)
     return entropy.new_tracker(params.half_life, params.tick)
 end
 
-function _M.new(params)
+function _M.new(params, incident_prefix)
     return {
         params = params,
         baseline = baseline.new({
@@ -54,8 +54,34 @@ function _M.new(params)
         share_at = {},
         states = {},
         seq = 0,
-        dry_run = false,
+        incident_prefix = incident_prefix or "",
     }
+end
+
+function _M.snapshot(ctx)
+    return {
+        baseline = baseline.snapshot(ctx.baseline),
+        shares = ctx.shares,
+        share_at = ctx.share_at,
+    }
+end
+
+function _M.restore(ctx, snap, now)
+    baseline.restore(ctx.baseline, snap.baseline, now)
+    if type(snap.shares) == "table" and type(snap.share_at) == "table" then
+        ctx.shares = snap.shares
+        ctx.share_at = snap.share_at
+    else
+        -- An older rate-only snapshot has no safe share reference yet.
+        ctx.baseline.started_at = now
+        ctx.baseline.mode = "normal"
+        ctx.baseline.below_since = nil
+    end
+end
+
+local function incident(ctx)
+    ctx.seq = ctx.seq + 1
+    return string.format("srg-%s%x", ctx.incident_prefix, ctx.seq)
 end
 
 local function histogram(map, total)
@@ -363,8 +389,7 @@ function _M.run(ctx, merged, now, previous)
                     and share - (base or 0) >= rise
                 then
                     if not st then
-                        ctx.seq = ctx.seq + 1
-                        st = escalation.new(string.format("srg-%x", ctx.seq))
+                        st = escalation.new(incident(ctx))
                         ctx.states[id] = st
                     end
                     if st.stage ~= "observe" and st.until_ts and now >= st.until_ts then
@@ -375,8 +400,7 @@ function _M.run(ctx, merged, now, previous)
                     -- Confidence is how much of the node this one site just
                     -- took over. Past confidence_skip each stage takes a tick.
                     local conf = math.min(1, share - (base or 0))
-                    local cap = ctx.dry_run and "observe" or "challenge"
-                    escalation.step(st, true, conf, p, now, cap)
+                    escalation.step(st, true, conf, p, now, "challenge")
                     emit(id, st, key, meta, share, base, rate, "host_surge")
                 elseif st then
                     escalation.step(st, false, 0, p, now, nil)
@@ -388,8 +412,7 @@ function _M.run(ctx, merged, now, previous)
                 -- Warmup has no share baseline. Cap one IPv4 address, not a
                 -- subnet total: a /24 over the same number is a busy NAT.
                 if not st then
-                    ctx.seq = ctx.seq + 1
-                    st = escalation.new(string.format("srg-%x", ctx.seq))
+                    st = escalation.new(incident(ctx))
                     ctx.states[id] = st
                 end
                 if st.stage == "observe" then
@@ -406,8 +429,7 @@ function _M.run(ctx, merged, now, previous)
                 local floor = math.max(p.abs_share, (base or 0) * p.multiplier)
                 if share > floor then
                     if not st then
-                        ctx.seq = ctx.seq + 1
-                        st = escalation.new(string.format("srg-%x", ctx.seq))
+                        st = escalation.new(incident(ctx))
                         ctx.states[id] = st
                     end
                     -- A decision that already expired must climb again.
@@ -417,8 +439,7 @@ function _M.run(ctx, merged, now, previous)
                         st.ttl = 0
                     end
                     local conf = confidence_of(share, floor, st.streak)
-                    local cap = ctx.dry_run and "observe" or nil
-                    escalation.step(st, true, conf, p, now, cap, api_only)
+                    escalation.step(st, true, conf, p, now, nil, api_only)
                     emit(id, st, key, meta, share, base, rate, "heavy_hitter")
                 elseif st then
                     escalation.step(st, false, 0, p, now, nil)

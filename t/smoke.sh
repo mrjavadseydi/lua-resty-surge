@@ -40,8 +40,12 @@ http {
         -- Competing timers expire before the drain after this tick publishes.
         local analyzer = require("resty.surge.analyzer")
         local run = analyzer.run
-        analyzer.run = function(...)
-            local snap = run(...)
+        analyzer.run = function(ctx, merged, now, previous)
+            if ngx.shared.surge:get("smoke:history") then
+                merged = {i4={}, h={ ["steady.test"]={count=200}, ["flooded.test"]={count=200} },
+                    _totals={i4=400, h=400}}
+            end
+            local snap = run(ctx, merged, now, previous)
             if ngx.shared.surge:get("smoke:timer-pressure") then
                 ngx.shared.surge:delete("smoke:timer-pressure")
                 for i = 1, 2 do
@@ -85,6 +89,23 @@ http {
                       reason = "manual", message = "manual block" },
                 })
                 ngx.say(ok and "published" or err)
+            }
+        }
+
+        location = /_history {
+            content_by_lua_block {
+                local now = ngx.now()
+                local snap = {
+                    baseline={mean=1000, var=0, mode="attack", seeded=true,
+                        started_at=now-300, updated_at=now, decay=0},
+                    shares={ ["h\\0steady.test"]=0.8, ["h\\0flooded.test"]=0.2,
+                        ["i4\\0" .. string.char(200,1,2,3)]=0.01 },
+                    share_at={ ["h\\0steady.test"]=now, ["h\\0flooded.test"]=now,
+                        ["i4\\0" .. string.char(200,1,2,3)]=now },
+                }
+                assert(ngx.shared.surge:safe_set("analyzer", require("cjson").encode(snap)))
+                ngx.shared.surge:set("smoke:history", true)
+                ngx.say("seeded")
             }
         }
 
@@ -309,6 +330,37 @@ done
     || fail "recovered notification was duplicated" "$PREFIX"
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.11" >/dev/null
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.12" >/dev/null
+
+# Restore the real serialized analyzer history through an nginx reload.
+curl -sf "http://127.0.0.1:$PORT/_history" | grep -q seeded || fail "history seed" "$PREFIX"
+sleep 2.5
+before=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+echo "$before" | grep -q '"target":"flooded.test"' || fail "flooded site not detected" "$PREFIX"
+echo "$before" | grep -q '"target":"steady.test"' && fail "steady site challenged before reload" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.20" >/dev/null
+sleep 0.8
+before=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+"$OR" -p "$PREFIX" -s reload
+sleep 3
+after=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+echo "$after" | grep -q '"target":"steady.test"' && fail "reload challenged steady site" "$PREFIX"
+echo "$after" | grep -q '"target":"flooded.test"' || fail "reload lost flooded site decision" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.21" >/dev/null
+sleep 0.8
+after=$(curl -sf "http://127.0.0.1:$PORT/_surge")
+BEFORE="$before" AFTER="$after" resty -e '
+local json = require "cjson"
+local function incident(text, target)
+    for _, d in ipairs(json.decode(text).decisions) do
+        if d.target == target then return d.incident end
+    end
+end
+local a = assert(incident(os.getenv("BEFORE"), "127.0.0.20"))
+local b = assert(incident(os.getenv("AFTER"), "127.0.0.21"))
+assert(a ~= b, "incident reused after reload")
+' || fail "reload incident IDs" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.20" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.21" >/dev/null
 
 curl -sf "http://127.0.0.1:$PORT/x?surge_fail=1" >/dev/null || fail "fail-open returned an error" "$PREFIX"
 sleep 0.6

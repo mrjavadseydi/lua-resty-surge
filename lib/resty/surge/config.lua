@@ -4,6 +4,7 @@
 
 local presets = require "resty.surge.presets"
 local clientip = require "resty.surge.clientip"
+local band = require("bit").band
 
 local _M = {}
 
@@ -19,6 +20,56 @@ for i = 1, #FEED_NAMES do
 end
 
 local MIN_DICT = 8 * 1024 * 1024
+
+local ZERO_OK = {
+    warmup = true, cooldown = true, min_rps = true, min_key_rps = true,
+    max_growth_per_hour = true, k_elev = true, k_attack = true, chal_ignore = true,
+}
+local INTEGERS = {
+    sample = true, topk = true, consecutive = true, gcra_burst = true,
+    pow_bits = true, chal_ignore = true, sketch_width = true, sketch_depth = true,
+}
+local FRACTIONS = {
+    abs_share = true, admit_share = true, entropy_drop = true,
+    entropy_rise = true, confidence_skip = true, host_share_rise = true,
+}
+
+local function validate_params(params)
+    for k, v in pairs(params) do
+        local valid
+        if k == "test_hooks" or k == "challenge_ready" then
+            valid = type(v) == "boolean"
+        else
+            valid = type(v) == "number" and v == v and v < math.huge
+                and (v > 0 or (v == 0 and (ZERO_OK[k] or FRACTIONS[k] or k == "multiplier")))
+            if valid and INTEGERS[k] then
+                valid = v == math.floor(v)
+            end
+            if valid and FRACTIONS[k] then
+                valid = v <= 1
+            end
+        end
+        if not valid then
+            error('surge: invalid value for parameter "' .. k .. '"')
+        end
+    end
+    if params.sample > 65535 or params.topk > 65535 then
+        error("surge: sample and topk must be <= 65535")
+    end
+    local width = params.sketch_width
+    if width < 4 or width > 2147483647 or band(width, width - 1) ~= 0 then
+        error("surge: sketch_width must be a power of two >= 4")
+    end
+    if params.sketch_depth ~= 4 then
+        error("surge: sketch_depth must be 4")
+    end
+    if params.pow_bits > 256 then
+        error("surge: pow_bits must be <= 256")
+    end
+    if params.ttl_max < params.ttl_base or params.k_attack < params.k_elev then
+        error("surge: ttl_max and k_attack must be >= ttl_base and k_elev")
+    end
+end
 
 local function feed_list()
     return table.concat(FEED_NAMES, ", ")
@@ -78,6 +129,7 @@ function _M.parse(opts)
             params[k] = v
         end
     end
+    validate_params(params)
 
     local expose = opts.expose_reason or "short"
     if not EXPOSE[expose] then

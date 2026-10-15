@@ -14,6 +14,21 @@ describe("count-min sketch", function()
         assert(z % 2 == 1)
     end)
 
+    it("does not repeat first-row collisions across all rows for equal-length IPs", function()
+        local function ip(n)
+            return string.char(10, math.floor(n / 65536) % 256,
+                math.floor(n / 256) % 256, n % 256)
+        end
+        local sk = sketch.new()
+        for i = 1, 200 do sketch.add(sk, ip(i), 1000) end
+        local bound = sketch.epsilon() * sketch.total(sk)
+        local over = 0
+        for i = 65536, 75535 do
+            if sketch.query(sk, ip(i)) > bound then over = over + 1 end
+        end
+        assert(over / 10000 < sketch.delta(), "correlated collisions: " .. over)
+    end)
+
     it("never underestimates and stays inside the CMS bound", function()
         math.randomseed(1)
         local width, depth = 2048, 4

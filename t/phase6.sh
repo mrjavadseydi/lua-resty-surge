@@ -99,6 +99,22 @@ http {
                 ngx.say(ok and "published" or err)
             }
         }
+        location = /_fpblock {
+            content_by_lua_block {
+                local codec = require "resty.surge.decisions"
+                local key = require("resty.surge.fingerprint").capture()
+                local d = ngx.shared.surge
+                local snap = codec.decode(d:get("dec")) or {mode="normal", list={}}
+                snap.list[#snap.list + 1] = {
+                    family="fp", key=key, action="block", reason="heavy_hitter",
+                    uri="/fp-check", manual=true, incident="fp-normal-regression",
+                    until_ts=ngx.now()+60, ttl=60, status=403,
+                }
+                assert(d:safe_set("dec", codec.encode(snap)))
+                assert(d:incr("v:dec", 1, 0))
+                ngx.say("published")
+            }
+        }
         location / {
             access_by_lua_block { require("resty.surge").protect() }
             content_by_lua_block { ngx.say("ok") }
@@ -133,6 +149,20 @@ trap 'stop "$PREFIX"; stop "$TRUST"; stop "$ALLOW"' EXIT
 wait_port "$HTTP" || fail "startup" "$PREFIX"
 
 curl -sf "http://127.0.0.1:$HTTP/" | grep -q ok || fail "allow" "$PREFIX"
+
+# An unexpired fingerprint decision still applies after mode returns to normal.
+curl -sf "http://127.0.0.1:$HTTP/_fpblock" | grep -q published || fail "fp publish" "$PREFIX"
+sleep 0.8
+curl -sf "http://127.0.0.1:$HTTP/_surge" | grep -q '"mode":"normal"' \
+    || fail "fp regression did not run in normal mode" "$PREFIX"
+i=0
+while [ "$i" -lt 20 ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP/fp-check")
+    [ "$code" = "403" ] || fail "fingerprint block bypassed in normal mode ($code)" "$PREFIX"
+    i=$((i + 1))
+done
+curl -sf -X POST "http://127.0.0.1:$HTTP/_surge?unblock=fp-normal-regression" >/dev/null
+sleep 0.8
 
 fp=$(curl -sS -D - -o /dev/null "http://127.0.0.1:$HTTP/?surge_fp=1" \
     | awk 'tolower($1)=="x-surge-fp:" { print $2 }' | tr -d '\r')

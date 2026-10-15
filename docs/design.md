@@ -8,7 +8,7 @@ No request-path code in this document. Phase 2 implements the algorithms against
 
 Zero config is three lines and does not enable the privileged agent, feeds, or `early()`. `start()` validates everything and raises before any worker accepts traffic. `protect()` never raises: `xpcall`, allow the request, add to a worker-local error counter, log once per tick.
 
-`ngx.worker.id()` is `nil` outside a worker or single process (the FFI returns -1 for the privileged agent and the master). Worker 0 is the leader candidate. During `nginx -s reload` two processes both have id 0, so a shared-dict lease (`pid` plus an expiry of one tick) decides who actually merges. The new worker 0 takes over on the first tick after the previous pid disappears (`ngx.worker.pids()` when present, otherwise when the lease expires). Baselines live in the dict, so a new leader does not start from zero.
+`ngx.worker.id()` is `nil` outside a worker or single process (the FFI returns -1 for the privileged agent and the master). Worker 0 is the leader candidate. During `nginx -s reload` two processes both have id 0, so a shared-dict lease (`pid` plus an expiry of one tick) decides who actually merges. The new worker 0 takes over on the first tick after the previous pid disappears (`ngx.worker.pids()` when present, otherwise when the lease expires). Rate and key-share baselines are saved atomically in the dict, so a new leader does not judge existing traffic against zero. Older rate-only snapshots receive one share-calibration warmup. Incident IDs include the worker PID and startup time, so a new leader cannot reuse an old decision's limiter or unblock ID.
 
 ## API check
 
@@ -61,7 +61,7 @@ init_by_lua_block { require("resty.surge").init() }
 
 **Stale baseline.** A dict baseline older than one half-life is kept as the seed, and warmup runs again. The seed's weight decays with its age, so a flood during the new warmup is not learned, and a seed many half-lives old gives way to fresh traffic. A reload inside the half-life does not re-warmup.
 
-**Export.** Atomic file rewrite is the v1 path. The unix datagram path is wired only after the runtime check. The sidecar example reads the file and fills an nftables set with timeouts.
+**Export.** Atomic file rewrite is the v1 path. The unix datagram path is wired only after the runtime check. The sidecar example reads the file and fills nftables sets with timeouts. Load `examples/nftables.conf` to connect those sets to input-chain drops on TCP ports 80 and 443. Kernel drops precede HTTP allow rules and match the TCP peer.
 
 ## Hot path (normal mode)
 
@@ -77,7 +77,7 @@ Deny responses are built once, when the decision is published, and stored on the
 
 ## Algorithms
 
-**Sketch.** `uint32_t[depth * width]`, default `2048 x 4`. `ε ≈ e / 2048 ≈ 0.00133`, `δ ≈ e^-4 ≈ 0.0183`. Width must be a power of two. Depth is fixed at 4 and unrolled. Two hashes, `h_i = h1 + i * h2`, `h2` forced odd. Conservative update: raise every counter that sits below `min + weight`, saturating at `2^32 - 1`. Saturation can underestimate; below the cap the sketch must not. Two buffers, swapped with `ffi.fill`, not reallocated.
+**Sketch.** `uint32_t[depth * width]`, default `2048 x 4`. `ε ≈ e / 2048 ≈ 0.00133`, `δ ≈ e^-4 ≈ 0.0183`. Width must be a power of two. Depth is fixed at 4 and unrolled. CRC-32 and FNV-1a supply `h_i = h1 + i * h2`, with `h2` forced odd. Two CRCs separated only by a fixed bytewise XOR would collide in all four rows for equal-length keys. Conservative update: raise every counter that sits below `min + weight`, saturating at `2^32 - 1`. Saturation can underestimate; below the cap the sketch must not. Two buffers, swapped with `ffi.fill`, not reallocated.
 
 **Top-K.** Space-Saving, K entries, tables reused, `table.clear` on the index. A new key is admitted only when its sketch estimate is at least `admit_share * window_total`. Replacement stores `count = min + weight`, `error = min`. The minimum slot is rescanned only when a current minimum is removed or incremented off the minimum.
 
@@ -85,9 +85,9 @@ Deny responses are built once, when the decision is published, and stored on the
 
 **Entropy.** Normalized Shannon over the merged buckets plus an "other" bucket, `H / log2(n)`, with `n` the number of positive buckets. `n <= 1` yields 0. The leader keeps an EWMA of `H_norm` per dimension and freezes it with the rate baseline.
 
-**GCRA.** One theoretical arrival time per limited decision, held in the shared dict as absolute seconds. `interval = 1 / rate`, `tau = (burst - 1) * interval`. Allow when `now >= tat - tau`, then `tat = max(now, tat) + interval`. There is no lock: `incr(interval)` returns the new tat, a denied request gives its interval back with a second `incr`, and a stale tat is moved to `now`. Two workers that race on a stale tat both move it, which denies slightly early, never late. Rate and burst are the node's. Unlimited keys do not consult the limiter, so the normal path still never touches the shared dict.
+**GCRA.** One theoretical arrival time per limited decision, held in the shared dict as absolute seconds. `interval = 1 / rate`, `tau = (burst - 1) * interval`. Allow when `now >= tat - tau`, then `tat = max(now, tat) + interval`. A non-yielding `safe_add` lock serializes each read/check/write. Contention rejects the current request without moving the clock; a full dictionary fails open. This prevents two workers from adding the same idle-time correction. Rate and burst are the node's. Unlimited keys do not consult the limiter, so the normal path still never touches the shared dict.
 
-**Decisions.** A key is an offender only when its share beats both the absolute floor and `baseline_share * multiplier`, its rate beats `min_key_rps`, and it is not allowlisted, not a good bot, and not challenge-verified. URIs are never blocked on their own. A decision may carry a URI prefix. ASN blocks require a hosting/datacenter flag and a higher confidence. Escalation is `observe → limit → challenge → block`, with the tick counts from the preset. API paths skip `challenge`. Repeat blocks double the TTL up to the preset cap. `dry_run` stops at observe and logs the action that was not taken.
+**Decisions.** A key is an offender only when its share beats both the absolute floor and `baseline_share * multiplier`, its rate beats `min_key_rps`, and it is not allowlisted, not a good bot, and not challenge-verified. URIs are never blocked on their own. A decision may carry a URI prefix. ASN blocks require a hosting/datacenter flag and a higher confidence. Escalation is `observe → limit → challenge → block`, with the tick counts from the preset. API paths skip `challenge`. Repeat blocks double the TTL up to the preset cap. `dry_run` computes and publishes the proposed stages normally; HTTP/TLS enforcement and kernel export are suppressed, and logs identify the proposed action as a dry run.
 
 ## Shared dict
 

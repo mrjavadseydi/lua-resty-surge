@@ -43,7 +43,7 @@ M.relaxed = preset({
     hard_ip_rps = 2000,
     -- A heavy key under this rate is not an offender, whatever its share.
     min_key_rps = 50,
-    -- Global rate the limit stage enforces for one key. Each worker gets rate/workers.
+    -- Node-wide rate the limit stage enforces for one key.
     limit_rps = 200,
     -- At or above this confidence a stage change takes one tick.
     confidence_skip = 0.95,
@@ -57,7 +57,7 @@ M.relaxed = preset({
     secret_rotate = 86400,
     sketch_width = 2048,
     sketch_depth = 4,
-    -- Extra requests the limit stage may pass at once, per worker.
+    -- Requests the limit stage may pass at once, across all workers.
     gcra_burst = 10,
     test_hooks = false,
     -- Seconds between worker re-reads of feed files. Remote updates also bump a shared version.

@@ -43,7 +43,8 @@ local allow4, allow6, allow_paths
 local sample_n = 0
 local seen_n = 0
 local sig = ""
-local baseline_saved = ""
+local analyzer_saved = ""
+local incident_prefix
 local shared
 local feed_rt = {
     loaded = false,
@@ -344,6 +345,7 @@ end
 -- What status() shows for one decision, and what on_decision receives.
 local function view_of(r, now)
     return {
+        dry_run = cfg.dry_run,
         incident = r.incident,
         action = r.action,
         reason = r.reason,
@@ -415,7 +417,9 @@ local function log_decisions(old, list)
     for i = 1, #list do
         local r = list[i]
         if r.action ~= "observe" and old[r.incident or ""] ~= r.action then
-            ngx.log(ngx.NOTICE, "surge: ", r.message or r.action or "")
+            ngx.log(ngx.NOTICE, "surge: ",
+                cfg.dry_run and ("dry-run would " .. r.action .. ": ") or "",
+                r.message or r.action or "")
             if cfg.on_decision then
                 notify(r)
             end
@@ -526,7 +530,7 @@ local function manual_record(it, rule, now)
         ttl = ttl,
         until_ts = now + ttl,
         manual = it.manual ~= false,
-        incident = it.incident or string.format("srg-%x-%x", state.id or 0, seq),
+        incident = it.incident or string.format("srg-%smanual-%x", incident_prefix, seq),
     }
 end
 
@@ -649,6 +653,24 @@ end
 local unpublished_old
 local merging = false
 
+local function restore_analyzer()
+    local saved = state.dict:get("analyzer")
+    if type(saved) == "string" then
+        if saved ~= analyzer_saved then
+            local prior = cjson.decode(saved)
+            if type(prior) == "table" and type(prior.baseline) == "table" then
+                analyzer.restore(an, prior, ngx.now())
+                analyzer_saved = saved
+            end
+        end
+    elseif analyzer_saved == "" then
+        local prior = baseline.import(state.dict:get("baseline"))
+        if prior then
+            analyzer.restore(an, { baseline = prior }, ngx.now())
+        end
+    end
+end
+
 local function merge(merged)
     maybe_rotate_secret(ngx.now())
     -- Before apply_ops: it appends queued blocks to box.list in place, and
@@ -657,14 +679,7 @@ local function merge(merged)
     apply_ops(ngx.now())
     -- Another leader may have saved a newer clock while this worker waited
     -- on the lease. Continue from that snapshot instead of overwriting it.
-    local saved = state.dict:get("baseline")
-    if type(saved) == "string" and saved ~= baseline_saved then
-        local prior = baseline.import(saved)
-        if prior then
-            baseline.restore(an.baseline, prior, ngx.now())
-            baseline_saved = saved
-        end
-    end
+    restore_analyzer()
     local snap = analyzer.run(an, merged, ngx.now(), box.list)
     local kept = {}
     local list = snap.list or {}
@@ -710,11 +725,16 @@ local function merge(merged)
     }), state.tick * 8)
     -- The next start() continues this clock. Otherwise every reload spends
     -- the whole warmup with no automatic decisions.
-    local text = baseline.export(an.baseline)
-    if text ~= baseline_saved then
-        local ok, berr = state.dict:safe_set("baseline", text)
+    -- Rate and share history must survive together, including binary IP keys.
+    local text, encode_err = cjson.encode(analyzer.snapshot(an))
+    if not text then
+        ngx.log(ngx.ERR, "surge: baseline encode failed: ", encode_err or "")
+        return
+    end
+    if text and text ~= analyzer_saved then
+        local ok, berr = state.dict:safe_set("analyzer", text)
         if ok then
-            baseline_saved = text
+            analyzer_saved = text
         else
             ngx.log(ngx.ERR, "surge: baseline save failed: ", berr or "")
         end
@@ -1116,7 +1136,7 @@ local function protect_inner()
     local want_fp = false
     if cfg.test_hooks and ngx.var.arg_surge_fp == "1" then
         want_fp = true
-    elseif box.mode ~= "normal" and ((box.fp_n or 0) > 0 or due_sample()) then
+    elseif (box.fp_n or 0) > 0 or (box.mode ~= "normal" and due_sample()) then
         -- A live fingerprint decision needs every request. Otherwise only
         -- the sampled ones are counted, so only those are built.
         want_fp = true
@@ -1403,16 +1423,9 @@ function _M.start(opts)
     end
 
     make_state(dict, id)
-    an = analyzer.new(cfg.params)
-    an.dry_run = cfg.dry_run
-    local saved = dict:get("baseline")
-    if type(saved) == "string" then
-        local snap = baseline.import(saved)
-        if snap then
-            baseline.restore(an.baseline, snap, ngx.now())
-            baseline_saved = saved
-        end
-    end
+    incident_prefix = string.format("%x-%x-", state.pid, math.floor(ngx.now() * 1000))
+    an = analyzer.new(cfg.params, incident_prefix)
+    restore_analyzer()
     started = true
 
     ensure_secret()

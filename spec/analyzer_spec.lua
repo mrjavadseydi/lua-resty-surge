@@ -229,7 +229,7 @@ describe("analyzer", function()
         assert(not seen.block, "a whole site was blocked")
     end)
 
-    it("keeps a host decision at observe in dry run", function()
+    it("keeps proposed host and IP actions visible in dry run", function()
         local ctx = analyzer.new(params())
         ctx.dry_run = true
         local now = 0
@@ -237,12 +237,69 @@ describe("analyzer", function()
             now = now + 0.25
             analyzer.run(ctx, sites(10), now, nil)
         end
+        local seen = {}
         for _ = 1, 8 do
             now = now + 0.25
             local snap = analyzer.run(ctx, sites(8000), now, nil)
             local rec = find(snap.list, "victim.io")
-            assert(not rec or rec.action == "observe")
+            if rec then seen[rec.action] = true end
         end
+        assert(seen.limit and seen.challenge)
+        local ip_ctx = analyzer.new(params())
+        ip_ctx.dry_run = true
+        local snap = reach_block(ip_ctx, 0)
+        assert(find(snap.list, attacker, "block"))
+    end)
+
+    it("restores share history during an attack without challenging an unchanged site", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local function traffic(a, b)
+            return {i4={}, h={ ["steady.test"]={count=a}, ["flooded.test"]={count=b} },
+                _totals={i4=a+b, h=a+b}}
+        end
+        local ctx = analyzer.new(p, "old-")
+        local now, snap = 1000
+        for _ = 1, 600 do
+            now = now + p.tick
+            snap = analyzer.run(ctx, traffic(200, 50), now, snap and snap.list)
+        end
+        for _ = 1, 8 do
+            now = now + p.tick
+            snap = analyzer.run(ctx, traffic(200, 200), now, snap.list)
+        end
+        assert(snap.mode == "attack")
+        assert(not find(snap.list, "steady.test"))
+        local fresh = analyzer.new(p, "new-")
+        analyzer.restore(fresh, analyzer.snapshot(ctx), now)
+        for _ = 1, 8 do
+            now = now + p.tick
+            snap = analyzer.run(fresh, traffic(200, 200), now, snap.list)
+            assert(not find(snap.list, "steady.test"))
+        end
+        assert(find(snap.list, "flooded.test", "challenge"))
+    end)
+
+    it("recalibrates shares when restoring an older rate-only snapshot", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local ctx = analyzer.new(p)
+        analyzer.restore(ctx, {baseline={mean=1000,var=0,mode="attack",seeded=true,
+            started_at=0,updated_at=1000}}, 1000)
+        local snap = analyzer.run(ctx, sites(8000), 1000)
+        assert(snap.warming and #snap.list == 0)
+    end)
+
+    it("does not reuse an adopted incident ID in a new leader", function()
+        local ctx = analyzer.new(params(), "new-")
+        local previous = {{family="v4",bits=32,key=nat,action="block",
+            reason="heavy_hitter",incident="srg-1",until_ts=2000,ttl=600}}
+        baseline.restore(ctx.baseline, {mean=400,var=0,mode="attack",seeded=true,
+            started_at=0,updated_at=1000}, 1000)
+        local snap = analyzer.run(ctx, flood(), 1000, previous)
+        local old = assert(find(snap.list, nat))
+        local new = assert(find(snap.list, attacker))
+        assert(old.incident == "srg-1")
+        assert(new.incident ~= old.incident)
+        assert(new.incident:find("srg-new-", 1, true) == 1)
     end)
 
     it("blocks a flood and leaves a steady NAT alone", function()

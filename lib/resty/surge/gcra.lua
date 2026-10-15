@@ -36,26 +36,20 @@ function _M.check(tat, now, interval, tau)
     return true, tat + interval
 end
 
--- GCRA on a shared dict with incr only: no lock, one incr per allowed
--- request, two per denied one. The dict holds tat in absolute seconds, so
--- a rate that changes between ticks does not corrupt it. Two workers that
--- both see a stale tat both move it forward; that denies a little early,
--- never late. A full dict fails open.
+-- Do not yield while holding the lock: protect() uses worker-local scratch.
+-- Contention rejects this request without adding debt. A full dict fails open.
 function _M.shared(dict, key, now, interval, tau, ttl)
-    local v = dict:incr(key, interval, now, ttl)
-    if not v then
-        return true
+    local lock = key .. ":lock"
+    local locked, err = dict:safe_add(lock, true, 1)
+    if not locked then
+        return err ~= "exists"
     end
-    local tat = v - interval
-    if tat < now then
-        dict:incr(key, now - tat)
-        return true
+    local allow, tat = _M.check(dict:get(key), now, interval, tau)
+    if allow then
+        dict:safe_set(key, tat, ttl)
     end
-    if tat - tau > now then
-        dict:incr(key, -interval)
-        return false
-    end
-    return true
+    dict:delete(lock)
+    return allow
 end
 
 return _M

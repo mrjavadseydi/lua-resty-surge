@@ -2,6 +2,7 @@
 # Read the file surge writes at export_path and refresh an nftables set.
 # Each line is: family bits address ttl incident
 # Lua does not call nft.
+# Load examples/nftables.conf first; sets alone do not drop packets.
 #
 #   nftables-sidecar.sh --watch [FILE]   check every second, apply on change
 #   nftables-sidecar.sh [FILE]           apply once

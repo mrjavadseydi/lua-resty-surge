@@ -47,6 +47,24 @@ describe("config", function()
         assert(config.needs_agent(remote.feeds))
     end)
 
+    it("rejects invalid advanced values before requests reach them", function()
+        local invalid = {
+            {sample=0}, {sample=1.5}, {sample=65536}, {gcra_burst=0},
+            {pow_bits=0}, {pow_bits=257}, {tick=-1}, {tick=math.huge},
+            {half_life=0/0}, {warmup=-1}, {topk="128"}, {topk=0},
+            {sketch_width=3}, {sketch_width=1000}, {sketch_depth=3},
+            {challenge_ready=1}, {test_hooks="true"}, {abs_share=2},
+            {ttl_max=1}, {k_attack=1},
+        }
+        for _, advanced in ipairs(invalid) do
+            assert(not pcall(config.parse, {advanced=advanced}))
+        end
+        assert(config.parse({advanced={warmup=0, cooldown=0, chal_ignore=0}}))
+        for _, mode in ipairs({"relaxed", "balanced", "strict"}) do
+            assert(config.parse({mode=mode}))
+        end
+    end)
+
     it("rejects duplicate feed names", function()
         local ok, err = pcall(config.parse, {
             feeds = {

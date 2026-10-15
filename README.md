@@ -37,14 +37,14 @@ location = /_surge {
 
 `GET /_surge?format=html` is a small dashboard: mode, request rate against the baseline, and the live decisions with a Remove button (the same `unblock` POST). It polls the JSON every 2s and loads nothing from outside. It is behind the same `allow`/`deny` as the location.
 
-`on_decision` is called once for each new or changed decision, on the leader, with the same fields a decision has in the JSON. It runs in a timer, so it can make HTTP calls. Queued hooks are retried each tick if timer capacity is exhausted. Hooks run one at a time and at most 256 wait, so give HTTP calls a short timeout. A hook that hangs delays every alert after it. For example, to post to a Slack webhook with `lua-resty-http`:
+`on_decision` is called once for each new or changed decision, on the leader, with the same fields a decision has in the JSON. Its `dry_run` field marks proposed actions during a dry run. It runs in a timer, so it can make HTTP calls. Queued hooks are retried each tick if timer capacity is exhausted. Hooks run one at a time and at most 256 wait, so give HTTP calls a short timeout. A hook that hangs delays every alert after it. For example, to post to a Slack webhook with `lua-resty-http`:
 
 ```lua
 on_decision = function(d)
     require("resty.http").new():request_uri(SLACK_WEBHOOK, {
         method = "POST",
         headers = { ["Content-Type"] = "application/json" },
-        body = require("cjson").encode({ text = "surge: " .. d.message }),
+        body = require("cjson").encode({ text = (d.dry_run and "surge dry-run: " or "surge: ") .. d.message }),
     })
 end,
 ```
@@ -75,7 +75,7 @@ In normal mode a request reads the client address once, checks the allow list, t
 
 The sampling interval grows with load. Each worker aims for about 512 sampled requests per tick, so a flood ten times bigger does not cost the sketches ten times more. Attack mode builds a fingerprint only for a sampled request, or for every request while a fingerprint decision is live.
 
-A leader tick (worker 0, with a lease so a reload cannot run two leaders) merges those sketches. The request rate is an EWMA with a frozen baseline during a surge, a cooldown before the mode drops, and a cap on how fast the baseline can grow. Warmup starts with the first traffic and calibrates from the samples received. A tick above the attack line is not learned, even during warmup. The rate baseline continues across reloads. The entropy baselines start over after a reload, and their signal is off until they have seen a warmup's worth of windows. Empty windows do not seed the rate or entropy baselines. Entropy over subnets, URLs, and fingerprints says whether the surge is a few sources, a botnet, one URL, or one client program. Heavy keys move from observe to limit, then a proof-of-work challenge, then a block. URLs are never blocked on their own. A dominant URL only narrows an IP or fingerprint decision to that path. A solved challenge sets a cookie bound to a /24 or a /64. The cookie skips later heavy-hitter limits. It does not skip a manual block or a reputation hit.
+A leader tick (worker 0, with a lease so a reload cannot run two leaders) merges those sketches. The request rate is an EWMA with a frozen baseline during a surge, a cooldown before the mode drops, and a cap on how fast the baseline can grow. Warmup starts with the first traffic and calibrates from the samples received. A tick above the attack line is not learned, even during warmup. The rate and key-share baselines are saved together and continue across reloads. Upgrading from an older rate-only snapshot recalibrates shares for one warmup window; existing decisions keep their TTLs. The entropy baselines start over after a reload, and their signal is off until they have seen a warmup's worth of windows. Empty windows do not seed the rate or entropy baselines. Entropy over subnets, URLs, and fingerprints says whether the surge is a few sources, a botnet, one URL, or one client program. Heavy keys move from observe to limit, then a proof-of-work challenge, then a block. URLs are never blocked on their own. A dominant URL only narrows an IP or fingerprint decision to that path. A solved challenge sets a cookie bound to a /24 or a /64. The cookie skips later heavy-hitter limits. It does not skip a manual block or a reputation hit.
 
 ## Many sites on one node
 
@@ -85,15 +85,17 @@ This is the case per-address rules miss: a botnet of thousands of addresses, eac
 
 The challenge page is 211 bytes. The proof-of-work script is one static file, `/.srg-pow.v1.js`, that the browser caches for a day. A bot that never runs JavaScript never downloads it. A solved cookie is verified with one HMAC per worker every 30s, not on every request, so a site's real viewers cost little more than normal traffic while it is challenged.
 
+Site detection compares traffic shares. With balanced settings, a site already carrying more than 75% of the traffic cannot gain the required 25 percentage points; a single-site node cannot change its site share at all. A distributed flood without heavy IPs or fingerprints can therefore enter attack mode without producing a site decision.
+
 Also add `limit_req_zone $host` and `limit_conn_zone $host` in nginx as a fixed per-site ceiling. See `examples/nginx.conf`.
 
-Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ... }` overrides one parameter at a time. `start()` rejects an unknown name and tells you the legal ones.
+Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ... }` overrides one parameter at a time. `start()` rejects an unknown name and tells you the legal ones. Invalid values, including zero sampling intervals and non-finite numbers, are rejected at startup.
 
 ## Limits
 
-This is not a firewall for volumetric L3 or L4 floods. If the uplink is full, nothing in nginx helps. Check the NIC graphs during an incident to tell a full link from busy workers. A block can be written to `export_path` for `examples/nftables-sidecar.sh --watch` to load into nftables within a second. Run it under systemd, not cron. A minute of cron delay is a minute of blocked clients still costing a TLS handshake each. That file is not written while `dry_run` is on, so a dry run cannot drop clients in the kernel. The module never runs a shell command itself.
+This is not a firewall for volumetric L3 or L4 floods. If the uplink is full, nothing in nginx helps. Check the NIC graphs during an incident to tell a full link from busy workers. A block can be written to `export_path` for `examples/nftables-sidecar.sh --watch` to load into nftables within a second. Load `examples/nftables.conf` once with `nft -f examples/nftables.conf`, then run the sidecar under systemd, not cron. The sidecar only fills sets; the ruleset supplies the actual drops on TCP ports 80 and 443. These rules match the TCP peer and run before HTTP allow rules, so export only networks intended for node-wide blocking, and adapt the rules to your existing firewall. Include the ruleset in your system nftables configuration so firewall reloads restore the drop rules. A minute of cron delay is a minute of blocked clients still costing a TLS handshake each. That file is not written while `dry_run` is on, so a dry run cannot drop clients in the kernel. The module never runs a shell command itself.
 
-The rate limit is one GCRA per decision in the shared dictionary, so its rate and burst hold for the node whichever worker a request lands on. Only a request that hits a limit decision touches it: one `incr` when allowed, two when denied. The sketch overestimates a little. Fingerprints are computed only after the mode leaves normal, and then only on sampled requests unless a fingerprint decision is live, because reading headers on every request costs too much. `early()` cannot see a path allow. ASN lookup is not included.
+The rate limit is one GCRA per decision in the shared dictionary, so its rate and burst hold for the node whichever worker a request lands on. Only a request that hits a limit decision touches it. A non-yielding shared lock serializes the clock update. A request that finds the lock busy receives 429 without adding debt; a full dictionary fails open. The sketch overestimates a little. Fingerprints are computed on sampled requests outside normal mode, and on every request while a fingerprint decision is live, including normal mode. `early()` cannot see a path allow. ASN lookup is not included.
 
 ## Measured results
 

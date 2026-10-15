@@ -47,6 +47,10 @@ local files = {
     "spec/escalation_spec.lua",
     "spec/analyzer_spec.lua",
     "spec/feeds_spec.lua",
+    "spec/challenge_spec.lua",
+    "spec/fingerprint_spec.lua",
+    "spec/ja4_spec.lua",
+    "spec/metrics_spec.lua",
 }
 
 for i = 1, #files do
