@@ -5,8 +5,10 @@
 -- the list. A single bucket has H_norm 0 (log2(1) is 0, so the ratio is
 -- defined as 0 rather than left undefined). Uniform over n is 1.
 --
--- The tracker is an EWMA of H_norm. Pass frozen=true while the process is
--- in elevated or attack mode so the reference distribution does not learn
+-- The tracker is an EWMA of H_norm, bias-corrected like the rate baseline so
+-- early samples are averaged rather than the first one sticking. weight() is
+-- the share of a full history it has seen. Pass frozen=true while the process
+-- is in elevated or attack mode so the reference distribution does not learn
 -- the attack.
 
 local log = math.log
@@ -47,6 +49,7 @@ function _M.new_tracker(half_life, tick)
     end
     local alpha = 1 - exp(-tick / half_life)
     local mean = nil
+    local decay = 1
 
     local tracker = {}
 
@@ -54,12 +57,17 @@ function _M.new_tracker(half_life, tick)
         if frozen then
             return mean
         end
+        decay = decay * (1 - alpha)
         if mean == nil then
             mean = h
         else
-            mean = mean + alpha * (h - mean)
+            mean = mean + alpha / (1 - decay) * (h - mean)
         end
         return mean
+    end
+
+    function tracker.weight()
+        return 1 - decay
     end
 
     function tracker.mean()

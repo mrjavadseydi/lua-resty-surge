@@ -59,7 +59,7 @@ init_by_lua_block { require("resty.surge").init() }
 
 **Entropy thresholds.** The preset table has no entropy numbers. `entropy_drop` and `entropy_rise` (absolute change in normalized H) will be added and tuned in the simulation. Starting point for balanced: `0.20`.
 
-**Stale baseline.** A dict baseline older than one half-life is kept as the seed, and warmup runs again. A reload inside the half-life does not re-warmup.
+**Stale baseline.** A dict baseline older than one half-life is kept as the seed, and warmup runs again. The seed's weight decays with its age, so a flood during the new warmup is not learned, and a seed many half-lives old gives way to fresh traffic. A reload inside the half-life does not re-warmup.
 
 **Export.** Atomic file rewrite is the v1 path. The unix datagram path is wired only after the runtime check. The sidecar example reads the file and fills an nftables set with timeouts.
 

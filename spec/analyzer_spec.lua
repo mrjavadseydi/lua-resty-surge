@@ -114,28 +114,35 @@ local function sites(victim_count)
     }
 end
 
+local function spread(n)
+    local traffic = empty()
+    for i = 1, n do
+        local ip = string.char(10, i, 0, 1)
+        traffic.i4[ip] = { count = 960 / n }
+        traffic.s4[ip:sub(1, 3)] = { count = 960 / n }
+        traffic.u["/page" .. i] = { count = 960 / n }
+    end
+    traffic._totals = { i4 = 960, s4 = 960, u = 960 }
+    return traffic
+end
+
 describe("analyzer", function()
     it("does not learn empty entropy windows before delayed steady traffic", function()
         local p = require("resty.surge.presets").copy("balanced")
         local ctx = analyzer.new(p)
-        for i = 0, 484 do
+        -- Idle for longer than warmup, then traffic.
+        local idle = math.ceil(p.warmup / p.tick) + 5
+        for i = 0, idle do
             analyzer.run(ctx, empty(), 1000 + i * p.tick)
         end
         for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
             assert(ctx.entropy[dim]:mean() == nil, dim .. " learned empty traffic")
         end
 
-        local traffic = empty()
-        for i = 1, 10 do
-            local ip = string.char(10, i, 0, 1)
-            traffic.i4[ip] = { count = 96 }
-            traffic.s4[ip:sub(1, 3)] = { count = 96 }
-            traffic.u["/page" .. i] = { count = 96 }
-        end
-        traffic._totals = { i4 = 960, s4 = 960, u = 960 }
+        local traffic = spread(10)
         local snap
         for i = 1, 800 do
-            snap = analyzer.run(ctx, traffic, 1121 + i * p.tick,
+            snap = analyzer.run(ctx, traffic, 1000 + (idle + i) * p.tick,
                 snap and snap.list)
             assert(snap.mode == "normal", "steady traffic entered " .. snap.mode)
             assert(#snap.list == 0, "steady traffic received a decision")
@@ -143,6 +150,27 @@ describe("analyzer", function()
         assert(not snap.warming)
         assert(ctx.entropy.s4:mean() > 0.9)
         assert(ctx.entropy.u:mean() > 0.9)
+    end)
+
+    it("does not judge entropy against one odd window after a reload", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local ctx = analyzer.new(p)
+        local now = 1000
+        for _ = 1, math.ceil(p.warmup / p.tick) + 10 do
+            now = now + p.tick
+            analyzer.run(ctx, spread(10), now)
+        end
+        -- Reload: the rate baseline is restored, the entropy trackers are new.
+        local fresh = analyzer.new(p)
+        baseline.restore(fresh.baseline, baseline.snapshot(ctx.baseline), now)
+        now = now + p.tick
+        local snap = analyzer.run(fresh, spread(1), now)
+        assert(not snap.warming)
+        for _ = 1, 40 do
+            now = now + p.tick
+            snap = analyzer.run(fresh, spread(10), now, snap.list)
+            assert(snap.mode == "normal", "odd first window led to " .. snap.mode)
+        end
     end)
 
     it("does not challenge steady sites after an empty startup tick", function()

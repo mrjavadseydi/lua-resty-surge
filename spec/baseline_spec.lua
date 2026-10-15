@@ -156,8 +156,9 @@ describe("ewma baseline", function()
             assert(mode == "normal", "steady traffic entered " .. mode .. " at tick " .. i)
         end
         assert(math.abs(b.mean - 3840) < 10, "mean " .. b.mean)
+        assert(b.var < 1, "partial first tick left variance " .. b.var)
         local mean, var = b.mean, b.var
-        assert(baseline.update(b, 38400, 4601, false) == "attack")
+        assert(baseline.update(b, 38400, 1000 + 14401 * p.tick, false) == "attack")
         assert(b.mean == mean and b.var == var, "attack changed calibration")
     end)
 
@@ -169,7 +170,8 @@ describe("ewma baseline", function()
             baseline.update(b, 3840, 1000 + i * p.tick, false)
         end
         local restored = baseline.new(p)
-        baseline.restore(restored, assert(baseline.import(baseline.export(b))), 1060)
+        baseline.restore(restored, assert(baseline.import(baseline.export(b))),
+            1000 + 241 * p.tick)
         for i = 241, 500 do
             local now = 1000 + i * p.tick
             local mode = baseline.update(b, 3840, now, false)
@@ -184,7 +186,7 @@ describe("ewma baseline", function()
         local p = require("resty.surge.presets").copy("balanced")
         local b = baseline.new(p)
         local snap = assert(baseline.import("64\n0\nnormal\n1000\n-\n1000\n1"))
-        assert(snap.warmup_samples == nil)
+        assert(snap.decay == nil)
         baseline.restore(b, snap, 1000)
         for i = 1, 500 do
             assert(baseline.update(b, 3840, 1000 + i * p.tick, false) == "normal")
@@ -271,7 +273,7 @@ describe("ewma baseline", function()
         baseline.restore(b, {
             mean = 80, var = 4, mode = "attack", seeded = true,
             started_at = 0, updated_at = 0, below_since = 0,
-            warmup_samples = 10000,
+            decay = 0,
         }, 1000)
         assert(b.mean == 80)
         assert(b.mode == "normal")
@@ -279,5 +281,57 @@ describe("ewma baseline", function()
         local mode = baseline.update(b, 1e9, 1010, false)
         assert(mode == "normal", mode)
         assert(b.mean > 1e8, "stale calibration history slowed fresh samples")
+    end)
+
+    it("does not learn a flood that starts during warmup", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        local n = math.floor(p.warmup / p.tick)
+        local mode
+        for i = 0, n + 4 do
+            local r = (i < n / 2) and (1000 + (i % 7) * 10) or 4000
+            mode = baseline.update(b, r, 1000 + i * p.tick, false)
+        end
+        assert(mode == "attack", mode)
+        assert(b.mean < 1100, "flood became the baseline: " .. b.mean)
+    end)
+
+    it("keeps a seed just past one half-life against a flood", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        local now = p.half_life * 1.5
+        baseline.restore(b, {
+            mean = 1000, var = 2500, mode = "normal", seeded = true,
+            started_at = 0, updated_at = 0, decay = 0.01,
+        }, now)
+        local mode
+        for i = 1, math.floor(p.warmup / p.tick) + 4 do
+            mode = baseline.update(b, 4000, now + i * p.tick, false)
+        end
+        assert(mode == "attack", mode)
+        assert(b.mean == 1000, "flood moved the stale seed: " .. b.mean)
+    end)
+
+    it("restores an old snapshot taken mid-warmup with its history", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        local b = baseline.new(p)
+        baseline.restore(b, assert(baseline.import(
+            "3840\n7744\nnormal\n1000\n-\n1090\n1")), 1090 + p.tick)
+        baseline.update(b, 0, 1090 + p.tick, false)
+        assert(b.mean > 3700, "one idle tick moved the mean to " .. b.mean)
+    end)
+
+    it("ignores an invalid saved decay", function()
+        local p = require("resty.surge.presets").copy("balanced")
+        for _, d in ipairs({ "-1", "0.5e9", "nan", "x" }) do
+            local b = baseline.new(p)
+            baseline.restore(b, assert(baseline.import(
+                "3840\n7744\nnormal\n1000\n-\n1090\n1\n" .. d)), 1090 + p.tick)
+            for i = 1, 10 do
+                baseline.update(b, 3840, 1090 + i * p.tick, false)
+            end
+            assert(b.mean == b.mean and b.var == b.var, "NaN from decay " .. d)
+            assert(math.abs(b.mean - 3840) < 10, "mean " .. b.mean)
+        end
     end)
 end)

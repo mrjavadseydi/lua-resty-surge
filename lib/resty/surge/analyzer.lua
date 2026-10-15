@@ -113,6 +113,9 @@ function _M.run(ctx, merged, now, previous)
     end
 
     local frozen_before = ctx.baseline.mode ~= "normal"
+    -- Trackers are not saved across reloads. Their signal counts only after a
+    -- warmup's worth of windows, so one odd first window is not the reference.
+    local entropy_ready = 1 - exp(-p.warmup / p.half_life)
     local entropy_info = {}
     local entropy_bad = false
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
@@ -127,7 +130,7 @@ function _M.run(ctx, merged, now, previous)
             local h = entropy.normalized(histogram(merged[dim], totals[dim]))
             local base = ctx.entropy[dim]:mean()
             local delta = 0
-            if base then
+            if base and ctx.entropy[dim]:weight() >= entropy_ready then
                 delta = h - base
                 local drop = delta <= -p.entropy_drop
                 -- A rise in fingerprint entropy is more kinds of clients.
@@ -147,7 +150,8 @@ function _M.run(ctx, merged, now, previous)
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
         local h = entropy_info[dim].h
         if h ~= nil then
-            local freeze = frozen or warming
+            -- Warmup learns entropy too, except on a tick the rate held.
+            local freeze = frozen or ctx.baseline.held
             -- Elevated is when fingerprints are first visible. That mix is
             -- the reference. Freeze it only once the mode is attack.
             if dim == "f" and mode == "elevated" then

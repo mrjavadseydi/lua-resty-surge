@@ -14,8 +14,12 @@
 -- mean * max_growth_per_hour * tick/3600. A ramp of a couple of percent a
 -- minute then cannot hide inside the average. Organic growth still crosses
 -- into elevated; that mode only counts more, it does not block anyone.
--- The first nonzero sample sets the mean with no clamp, so a cold process is not
--- stuck at zero. Warmup weights only the samples received, not a full half-life.
+-- The first nonzero sample sets the mean with no weight: it is usually a partial
+-- window, so the next sample replaces it. decay is the weight of the history
+-- not yet seen, a running product of (1 - α). Dividing α by (1 - decay) weights
+-- only the samples received, so warmup calibrates from them.
+-- Warmup has no clamp. Instead, once there is a spread, a tick above the attack
+-- line is not learned, the same rule as the freeze after warmup.
 
 local exp = math.exp
 local sqrt = math.sqrt
@@ -51,8 +55,9 @@ function _M.new(opts)
         below_since = nil,
         updated_at = nil,
         seeded = false,
-        warmup_samples = 0,
+        decay = 1,
         warming = true,
+        held = false,
     }
 end
 
@@ -64,15 +69,14 @@ local function apply_ewma(b, r)
         b.mean = r
         b.var = 0
         b.seeded = true
-        b.warmup_samples = 1
+        b.decay = 1
         return
     end
 
     local alpha = b.alpha
+    b.decay = b.decay * (1 - alpha)
     if b.warming then
-        b.warmup_samples = b.warmup_samples + 1
-        -- Normalize away the history that has not arrived during calibration.
-        alpha = alpha / (1 - exp(-b.warmup_samples * b.tick / b.half_life))
+        alpha = alpha / (1 - b.decay)
     end
     local diff = r - b.mean
     local incr = alpha * diff
@@ -117,6 +121,13 @@ function _M.update(b, rps, now, entropy_attack)
     local want_attack = ready and (entropy_ok or rps > atk_line)
     local want_elev = ready and (rps > elev_line)
 
+    -- During warmup an attack tick is not learned either. It needs a spread
+    -- and history worth one sample, so a provisional or very stale seed is
+    -- still replaced.
+    local held = warming and b.var > 0 and b.decay <= 1 - b.alpha
+        and rps > atk_line
+    b.held = held
+
     local mode = b.mode
     if not ready then
         mode = "normal"
@@ -153,7 +164,7 @@ function _M.update(b, rps, now, entropy_attack)
     end
 
     b.mode = mode
-    if mode == "normal" then
+    if mode == "normal" and not held then
         apply_ewma(b, rps)
     end
     b.updated_at = now
@@ -179,7 +190,7 @@ function _M.export(b)
     return table.concat({
         field(s.mean), field(s.var), s.mode or "normal",
         field(s.started_at), field(s.below_since), field(s.updated_at),
-        s.seeded and "1" or "0", field(s.warmup_samples),
+        s.seeded and "1" or "0", field(s.decay),
     }, "\n")
 end
 
@@ -187,7 +198,7 @@ function _M.import(text)
     if type(text) ~= "string" then
         return nil
     end
-    local mean, var, mode, started, below, updated, seeded, warmup_samples =
+    local mean, var, mode, started, below, updated, seeded, decay =
         text:match("([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n?([^\n]*)")
     if not mean then
         return nil
@@ -206,7 +217,7 @@ function _M.import(text)
         below_since = num(below),
         updated_at = num(updated),
         seeded = seeded == "1",
-        warmup_samples = num(warmup_samples),
+        decay = num(decay),
     }
 end
 
@@ -219,12 +230,13 @@ function _M.snapshot(b)
         below_since = b.below_since,
         updated_at = b.updated_at,
         seeded = b.seeded,
-        warmup_samples = b.warmup_samples,
+        decay = b.decay,
     }
 end
 
 -- A baseline older than one half-life is kept as the seed, but warmup runs
--- again. A reload inside the half-life continues with the saved clock.
+-- again and the seed's weight decays by its age. A reload inside the
+-- half-life continues with the saved clock.
 function _M.restore(b, snap, now)
     b.mean = snap.mean or 0
     b.var = snap.var or 0
@@ -236,13 +248,25 @@ function _M.restore(b, snap, now)
     if b.mean == 0 and b.var == 0 then
         b.seeded = false
     end
-    b.warmup_samples = b.seeded and (snap.warmup_samples or 1) or 0
+    local decay = snap.decay
+    if not b.seeded then
+        decay = 1
+    elseif type(decay) ~= "number" or not (decay >= 0 and decay <= 1) then
+        -- Older or damaged snapshot: one sample per tick since the seed.
+        local span = 0
+        if snap.started_at and snap.updated_at then
+            span = snap.updated_at - snap.started_at
+        end
+        decay = exp(-max(span, b.tick) / b.half_life)
+    end
+    b.decay = decay
     b.updated_at = snap.updated_at
+    b.held = false
 
     local stale = snap.updated_at ~= nil and now ~= nil
         and (now - snap.updated_at) > b.half_life
     if stale then
-        b.warmup_samples = b.seeded and 1 or 0
+        b.decay = 1 - (1 - decay) * exp(-(now - snap.updated_at) / b.half_life)
         b.started_at = now
         b.mode = "normal"
         b.below_since = nil
