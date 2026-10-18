@@ -34,6 +34,10 @@ local FRACTIONS = {
     entropy_rise = true, confidence_skip = true, host_share_rise = true,
 }
 
+-- 0 is legal for these. A zero abs_share, entropy or host threshold
+-- makes every key, tick or site an offender.
+local ZERO_FRACTION = { admit_share = true, confidence_skip = true }
+
 local function validate_params(params)
     for k, v in pairs(params) do
         local valid
@@ -41,7 +45,7 @@ local function validate_params(params)
             valid = type(v) == "boolean"
         else
             valid = type(v) == "number" and v == v and v < math.huge
-                and (v > 0 or (v == 0 and (ZERO_OK[k] or FRACTIONS[k] or k == "multiplier")))
+                and (v > 0 or (v == 0 and (ZERO_OK[k] or ZERO_FRACTION[k] or k == "multiplier")))
             if valid and INTEGERS[k] then
                 valid = v == math.floor(v)
             end
@@ -63,8 +67,20 @@ local function validate_params(params)
     if params.sketch_depth ~= 4 then
         error("surge: sketch_depth must be 4")
     end
-    if params.pow_bits > 256 then
-        error("surge: pow_bits must be <= 256")
+    -- 2^24 hashes is tens of seconds of a phone's JavaScript.
+    if params.pow_bits > 24 then
+        error("surge: pow_bits must be <= 24")
+    end
+    -- A browser gets one page before its script runs; 1 or 2 blocks it.
+    if params.chal_ignore ~= 0 and params.chal_ignore < 3 then
+        error("surge: chal_ignore must be 0 (off) or >= 3")
+    end
+    -- Every tick merges every worker's sketches in a timer.
+    if params.tick < 0.05 then
+        error("surge: tick must be >= 0.05")
+    end
+    if params.half_life < 10 then
+        error("surge: half_life must be >= 10 seconds")
     end
     if params.ttl_max < params.ttl_base or params.k_attack < params.k_elev then
         error("surge: ttl_max and k_attack must be >= ttl_base and k_elev")

@@ -6,7 +6,7 @@ No request-path code in this document. Phase 2 implements the algorithms against
 
 ## What the install is allowed to do
 
-Zero config is three lines and does not enable the privileged agent, feeds, or `early()`. `start()` validates everything and raises before any worker accepts traffic. `protect()` never raises: `xpcall`, allow the request, add to a worker-local error counter, log once per tick.
+Zero config is three lines and does not enable the privileged agent, feeds, or `early()`. `start()` validates everything and raises. nginx does not stop on an `init_worker` error, so the workers then serve unprotected; `/_surge` answers 500 with the rejection in every format, which is what monitoring should watch. `protect()` never raises: `xpcall`, allow the request, add to a worker-local error counter, log once per tick.
 
 `ngx.worker.id()` is `nil` outside a worker or single process (the FFI returns -1 for the privileged agent and the master). Worker 0 is the leader candidate. During `nginx -s reload` two processes both have id 0, so a shared-dict lease (`pid` plus an expiry of one tick) decides who actually merges. The new worker 0 takes over on the first tick after the previous pid disappears (`ngx.worker.pids()` when present, otherwise when the lease expires). Rate and key-share baselines are saved atomically in the dict, so a new leader does not judge existing traffic against zero. Older rate-only snapshots receive one share-calibration warmup. Incident IDs include the worker PID and startup time, so a new leader cannot reuse an old decision's limiter or unblock ID.
 
@@ -65,7 +65,7 @@ init_by_lua_block { require("resty.surge").init() }
 
 ## Hot path (normal mode)
 
-Worker-local data only. One read of the client address. Allowlist radix or hash, and a path-prefix check only when a path allowlist exists. Decision lookup on the binary address, then on the prefix, in separate v4 and v6 structures. Reputation radix. A module upvalue counts requests; every Nth one updates the sketches. No `math.random`, no shared dict, no header read, no `ngx.update_time`, no new table, no key concatenation.
+Worker-local data only. One read of the client address. Allowlist radix or hash, and a path-prefix check only when a path allowlist exists. Decision lookup on the binary address, then on the prefix, in separate v4 and v6 structures. Reputation radix. A module upvalue counts requests; every Nth one updates the sketches. No `math.random`, no shared dict, no `ngx.update_time`, no new table, no key concatenation. Only that Nth request reads the capped header set for its fingerprint, so a spike that goes straight to attack meets fingerprints with a baseline.
 
 `string.byte` walks the key for the hash so the hot path does not allocate a pointer cdata per call. Phase 2 measures this against `ngx.crc32_short`. The winner is the one that is faster on 4-byte and 16-byte keys and does not abort the LuaJIT trace.
 

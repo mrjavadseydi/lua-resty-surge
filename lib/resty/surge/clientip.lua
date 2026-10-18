@@ -120,6 +120,18 @@ function _M.parse_cidr(spec)
     if bits < 0 or bits > maxb then
         return nil, "bad prefix length"
     end
+    -- 1.2.3.4/24 is the network 1.2.3.0/24: clear the host bits so the
+    -- label, the export and an exact-match unblock all see one form.
+    if bits < maxb then
+        local full = math.floor(bits / 8)
+        local rem = bits % 8
+        local head = sub(bin, 1, full)
+        if rem > 0 then
+            head = head .. char(band(byte(bin, full + 1), band(lshift(0xff, 8 - rem), 0xff)))
+            full = full + 1
+        end
+        bin = head .. string.rep("\0", #bin - full)
+    end
     return { bin = bin, bits = bits, v6 = #bin == 16 }
 end
 

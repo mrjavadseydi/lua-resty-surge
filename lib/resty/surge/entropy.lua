@@ -53,15 +53,21 @@ function _M.new_tracker(half_life, tick)
 
     local tracker = {}
 
-    function tracker.update(_, h, frozen)
+    -- `ticks` is how many windows `h` pools, so the half-life stays in
+    -- seconds when the caller reads several windows at once.
+    function tracker.update(_, h, frozen, ticks)
         if frozen then
             return mean
         end
-        decay = decay * (1 - alpha)
+        local a = alpha
+        if ticks and ticks > 1 then
+            a = 1 - (1 - alpha) ^ ticks
+        end
+        decay = decay * (1 - a)
         if mean == nil then
             mean = h
         else
-            mean = mean + alpha / (1 - decay) * (h - mean)
+            mean = mean + a / (1 - decay) * (h - mean)
         end
         return mean
     end

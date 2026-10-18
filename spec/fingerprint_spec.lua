@@ -70,6 +70,12 @@ describe("http fingerprint", function()
             cookie = false,
         })
         assert(bare == solved)
+        local none = fp.parse_raw("accept: */*\r\n", 32)
+        assert(only.order == none.order)
+        assert(both.order ~= none.order)
+        assert(fp.presence({ cookie = "srg_pow=x", accept = "*/*" })
+            == fp.presence({ accept = "*/*" }))
+        assert(fp.presence({ cookie = { "srg_pow=x", "a=1" } }) == "c")
     end)
 
     it("stops reading after the cap", function()

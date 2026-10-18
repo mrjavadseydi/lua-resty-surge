@@ -51,7 +51,7 @@ end,
 
 Each decision lists its `target` (address, CIDR, or fingerprint id) and `expires_in` seconds. Every worker answers with the same rate and baseline numbers.
 
-`POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident or address>` update the manual list. Unblock takes the incident id or the exact address or CIDR of a decision (`1.2.3.0/24` for a subnet block). Both are queued for the leader and take effect within one tick.
+`POST /_surge?block=203.0.113.4&ttl=600` and `POST /_surge?unblock=<incident or address>` update the manual list. Unblock takes the incident id or the exact address or CIDR of a decision (`1.2.3.0/24` for a subnet block). Both are queued for the leader and take effect within one tick. Unblocking an automatic decision restarts that key at observe; it is not an exemption, and a key still flooding is limited again after `consecutive` ticks. Put an address in `allow` to exempt it. An unblock that matches no decision gets 404. Manual blocks live in the shared dictionary: they survive a reload, not a full restart. Keep the ones you need in nginx `deny` or a `custom` feed file. Blocking a network that already has a manual block replaces it, ttl included. A POST whose `Origin` is another host, or whose `Sec-Fetch-Site` is `cross-site` or `same-site`, gets 403: another page cannot drive the operator's browser into a block. A block wider than /8 (IPv4) or /16 (IPv6) is refused, and host bits are cleared (`1.2.3.4/24` is `1.2.3.0/24`).
 
 Manual blocks take precedence over automatic decisions for overlapping networks.
 
@@ -71,17 +71,17 @@ A feed that is only a local file does not need that.
 
 ## What it does
 
-In normal mode a request reads the client address once, checks the allow list, the decision table, and the reputation table, and sometimes updates a small sketch. It does not read headers and it does not touch the shared dictionary.
+In normal mode a request reads the client address once, checks the allow list, the decision table, and the reputation table, and sometimes updates a small sketch. Only that sampled request reads headers, for its fingerprint. It does not touch the shared dictionary.
 
 The sampling interval grows with load. Each worker aims for about 512 sampled requests per tick, so a flood ten times bigger does not cost the sketches ten times more. Attack mode builds a fingerprint only for a sampled request, or for every request while a fingerprint decision is live.
 
-A leader tick (worker 0, with a lease so a reload cannot run two leaders) merges those sketches. The request rate is an EWMA with a frozen baseline during a surge, a cooldown before the mode drops, and a cap on how fast the baseline can grow. Warmup starts with the first traffic and calibrates from the samples received. A tick above the attack line is not learned, even during warmup. The rate and key-share baselines are saved together and continue across reloads. Upgrading from an older rate-only snapshot recalibrates shares for one warmup window; existing decisions keep their TTLs. The entropy baselines start over after a reload, and their signal is off until they have seen a warmup's worth of windows. Empty windows do not seed the rate or entropy baselines. Entropy over subnets, URLs, and fingerprints says whether the surge is a few sources, a botnet, one URL, or one client program. Heavy keys move from observe to limit, then a proof-of-work challenge, then a block. URLs are never blocked on their own. A dominant URL only narrows an IP or fingerprint decision to that path. A solved challenge sets a cookie bound to a /24 or a /64. The cookie skips later heavy-hitter limits. It does not skip a manual block or a reputation hit.
+A leader tick (worker 0, with a lease so a reload cannot run two leaders) merges those sketches. The request rate is an EWMA with a frozen baseline during a surge, a cooldown before the mode drops, and a cap on how fast the baseline can grow. Warmup starts with the first traffic and calibrates from the samples received. A tick above the attack line is not learned, even during warmup. The rate and key-share baselines are saved together and continue across reloads. Upgrading from an older rate-only snapshot recalibrates shares for one warmup window; existing decisions keep their TTLs. The entropy baselines start over after a reload, and their signal is off until they have seen a warmup's worth of windows. Empty windows do not seed the rate or entropy baselines. Entropy over subnets, URLs, and fingerprints says whether the surge is a few sources, a botnet, one URL, or one client program. Heavy keys move from observe to limit, then a proof-of-work challenge, then a block. URLs are never blocked on their own. A dominant URL only narrows an IP or fingerprint decision to that path. A solved challenge sets a cookie bound to a /24 or a /64. The cookie skips later heavy-hitter decisions on a /24 or a fingerprint, and the challenge on the solver's own address. A limit or block on that address (/32, or its /64) still applies, so one solve does not let a flooding address through. It does not skip a manual block or a reputation hit.
 
 ## Many sites on one node
 
 Each request is also counted by `Host`. During a surge, a site whose share of the node's traffic rises by `host_share_rise` (0.25 in balanced) gets a site-wide decision: first a limit at about twice its normal rate, then the challenge page. A site is never blocked outright. API requests (`api` prefixes, or `Accept: json` with no cookie) are rate-held instead of challenged. A solved cookie skips the site challenge. The other sites on the node are not touched.
 
-This is the case per-address rules miss: a botnet of thousands of addresses, each under `min_key_rps`, with randomized headers. An address that gets `chal_ignore` challenge pages (10 in balanced) within 10s without solving one is blocked. That block is a manual block with no path, so `early()` closes it during the handshake, `protect()` answers it with a bare 444, and `export_path` hands it to nftables. IPv6 is blocked as its /64.
+This is the case per-address rules miss: a botnet of thousands of addresses, each under `min_key_rps`, with randomized headers. An address that gets `chal_ignore` challenge pages (10 in balanced) within 10s without solving one is blocked. An address that solved one in the last `pow_ttl` is not counted: a real browser is behind it, and a feed reader on the same NAT must not get that browser blocked. That block is a manual block with no path, so `early()` closes it during the handshake, `protect()` answers it with a bare 444, and `export_path` hands it to nftables. IPv6 is blocked as its /64.
 
 The challenge page is 211 bytes. The proof-of-work script is one static file, `/.srg-pow.v1.js`, that the browser caches for a day. A bot that never runs JavaScript never downloads it. A solved cookie is verified with one HMAC per worker every 30s, not on every request, so a site's real viewers cost little more than normal traffic while it is challenged.
 
@@ -89,13 +89,13 @@ Site detection compares traffic shares. With balanced settings, a site already c
 
 Also add `limit_req_zone $host` and `limit_conn_zone $host` in nginx as a fixed per-site ceiling. See `examples/nginx.conf`.
 
-Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ... }` overrides one parameter at a time. `start()` rejects an unknown name and tells you the legal ones. Invalid values, including zero sampling intervals and non-finite numbers, are rejected at startup.
+Presets are `relaxed`, `balanced` (the default), and `strict`. `advanced = { ... }` overrides one parameter at a time. `start()` rejects an unknown name and tells you the legal ones. Invalid values, including zero sampling intervals and non-finite numbers, are rejected at startup. nginx keeps running after that error, unprotected, and `nginx -t` cannot see it: `/_surge` then answers 500 with the reason, in JSON and Prometheus alike.
 
 ## Limits
 
 This is not a firewall for volumetric L3 or L4 floods. If the uplink is full, nothing in nginx helps. Check the NIC graphs during an incident to tell a full link from busy workers. A block can be written to `export_path` for `examples/nftables-sidecar.sh --watch` to load into nftables within a second. Load `examples/nftables.conf` once with `nft -f examples/nftables.conf`, then run the sidecar under systemd, not cron. The sidecar only fills sets; the ruleset supplies the actual drops on TCP ports 80 and 443. These rules match the TCP peer and run before HTTP allow rules, so export only networks intended for node-wide blocking, and adapt the rules to your existing firewall. Include the ruleset in your system nftables configuration so firewall reloads restore the drop rules. A minute of cron delay is a minute of blocked clients still costing a TLS handshake each. That file is not written while `dry_run` is on, so a dry run cannot drop clients in the kernel. The module never runs a shell command itself.
 
-The rate limit is one GCRA per decision in the shared dictionary, so its rate and burst hold for the node whichever worker a request lands on. Only a request that hits a limit decision touches it. A non-yielding shared lock serializes the clock update. A request that finds the lock busy receives 429 without adding debt; a full dictionary fails open. The sketch overestimates a little. Fingerprints are computed on sampled requests outside normal mode, and on every request while a fingerprint decision is live, including normal mode. `early()` cannot see a path allow. ASN lookup is not included.
+The rate limit is one GCRA per decision in the shared dictionary, so its rate and burst hold for the node whichever worker a request lands on. Only a request that hits a limit decision touches it. A non-yielding shared lock serializes the clock update. A request that finds the lock busy receives 429 without adding debt; a full dictionary fails open. The sketch overestimates a little. Fingerprints are computed on sampled requests, and on every request while a fingerprint decision is live. `early()` cannot see a path allow. ASN lookup is not included.
 
 ## Measured results
 
@@ -107,7 +107,7 @@ make bench7
 make bench-cost
 ```
 
-`make sim` runs `sim/run.lua`: the real analyzer, one merged top-K per tick, fingerprints omitted while the mode is normal. It is not a live packet flood. It does not cover the `chal_ignore` blocks, which happen on the request path; `make smoke` checks those. Balanced mode:
+`make sim` runs `sim/run.lua`: the real analyzer, one merged top-K per tick, fingerprints omitted while the mode is normal (the server samples them in every mode). It is not a live packet flood. It does not cover the `chal_ignore` blocks, which happen on the request path; `make smoke` checks those. Balanced mode:
 
 | Scenario | Detect | Block | Legit requests denied |
 |---|---|---|---|

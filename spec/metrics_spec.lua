@@ -50,6 +50,31 @@ describe("kernel export", function()
         assert(body:find("10.1.2.0", 1, true) or body:find("10.1.2", 1, true))
     end)
 
+    it("leaves out a network inside another so nft gets no overlap", function()
+        local function rec(fam, bits, key, ttl, id)
+            return { family = fam, bits = bits, key = key, action = "block",
+                manual = true, ttl = ttl, incident = id }
+        end
+        local lines = export.lines({
+            rec("v4", 24, string.char(10, 1, 2), 600, "net"),
+            rec("v4", 32, string.char(10, 1, 2, 3), 900, "inside"),
+            rec("v4", 32, string.char(10, 9, 9, 9), 60, "short"),
+            rec("v4", 32, string.char(10, 9, 9, 9), 600, "long"),
+            -- Host bits set: written as the network.
+            rec("v4", 16, string.char(10, 7, 8, 9), 600, "hostbits"),
+            rec("v6", 64, string.char(0xfd, 0, 0, 1, 0, 0, 0, 0), 600, "v6net"),
+            rec("v6", 128, string.char(0xfd, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5),
+                600, "v6inside"),
+        }, nil, 0.9)
+        local body = table.concat(lines, "\n")
+        assert(#lines == 4, body)
+        assert(body:find("v4 24 10.1.2.0 600 net", 1, true), body)
+        assert(not body:find("inside", 1, true), body)
+        assert(body:find("v4 32 10.9.9.9 600 long", 1, true), body)
+        assert(body:find("v4 16 10.7.0.0 600 hostbits", 1, true), body)
+        assert(body:find("v6 64 fd00:0001:0000:0000:0000:0000:0000:0000 600 v6net", 1, true), body)
+    end)
+
     it("drops an expired block and a low-confidence automatic one", function()
         local lines = export.lines({
             {
@@ -79,5 +104,17 @@ describe("kernel export", function()
         assert(not metrics.has_line(blob, "reputation:firehol_level"))
         assert(not metrics.has_line(blob, "manual"))
         assert(metrics.has_line(blob, "manual_x"))
+    end)
+end)
+
+describe("decision labels", function()
+    local messages = require "resty.surge.messages"
+    it("prints IPv6 as text, compressed, for any prefix", function()
+        assert(messages.label(string.char(0xfd, 0, 0, 1, 0, 0, 0, 0), 64, true) == "fd00:1::/64")
+        assert(messages.label(string.rep("\0", 16), 0, true) == "::/0")
+        assert(messages.label(string.char(0x20, 1, 0x0d, 0xb8) .. string.rep("\0", 11) .. "\1",
+            128, true) == "2001:db8::1")
+        assert(messages.label(string.char(10, 1, 2), 24) == "10.1.2.0/24")
+        assert(messages.label(string.char(10, 1, 2, 3), 32) == "10.1.2.3")
     end)
 end)

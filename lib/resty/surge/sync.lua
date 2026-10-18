@@ -154,14 +154,15 @@ local function lead(dict, pid, ttl)
     return false
 end
 
-local function merge_dim(dict, nworkers, suffix, into, totals)
-    local total = 0
+local function merge_dim(dict, nworkers, suffix, into, totals, samples)
+    local total, raw = 0, 0
     for id = 0, nworkers - 1 do
         local blob = dict:get("w" .. id .. ":" .. suffix)
         if blob then
-            local items, _, dim_total = _M.decode_topk(blob)
+            local items, scale, dim_total = _M.decode_topk(blob)
             if dim_total then
                 total = total + dim_total
+                raw = raw + dim_total / scale
             end
             if items then
                 for i = 1, #items do
@@ -184,6 +185,8 @@ local function merge_dim(dict, nworkers, suffix, into, totals)
         end
     end
     totals[suffix] = total
+    -- Requests actually sampled, before the scale. Entropy needs the count.
+    samples[suffix] = raw
 end
 
 function _M.tick(state)
@@ -220,14 +223,15 @@ function _M.tick(state)
     end
 
     local merged = {}
-    local totals = {}
+    local totals, samples = {}, {}
     for i = 1, #dims do
         local d = dims[i]
         local acc = {}
-        merge_dim(dict, state.nworkers, d.suffix, acc, totals)
+        merge_dim(dict, state.nworkers, d.suffix, acc, totals, samples)
         merged[d.suffix] = acc
     end
     merged._totals = totals
+    merged._samples = samples
     state.merged = merged
     if state.analyze then
         state.analyze(merged)

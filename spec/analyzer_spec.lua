@@ -127,6 +127,34 @@ local function spread(n)
 end
 
 describe("analyzer", function()
+    it("does not read sampling noise in a steady mix as an entropy attack", function()
+        -- 600 rps at 1/16: nine sampled requests a tick, each counted 16 times.
+        math.randomseed(7)
+        local p = params()
+        p.warmup = 30
+        local ctx = analyzer.new(p)
+        local now = 1000
+        for t = 1, 2400 do
+            local w = empty()
+            for _ = 1, 9 do
+                local ip = string.char(10, 2, math.random(0, 255), math.random(0, 255))
+                local path = "/p" .. math.floor(50 ^ math.random())
+                w.i4[ip] = { key = ip, count = 16, error = 0 }
+                local e = w.u[path]
+                if e then
+                    e.count = e.count + 16
+                else
+                    w.u[path] = { key = path, count = 16, error = 0 }
+                end
+            end
+            w._totals = { i4 = 150, i6 = 0, s4 = 0, s6 = 0, u = 150 }
+            w._samples = { i4 = 9, u = 9 }
+            now = now + 0.25
+            local snap = analyzer.run(ctx, w, now, nil)
+            assert(snap.mode ~= "attack", "attack at tick " .. t)
+        end
+    end)
+
     it("does not learn empty entropy windows before delayed steady traffic", function()
         local p = require("resty.surge.presets").copy("balanced")
         local ctx = analyzer.new(p)
@@ -631,6 +659,172 @@ describe("analyzer", function()
             end
         end
         assert(bot_hit, "majority fingerprint was not escalated")
+    end)
+
+    it("judges an attack at warmup end against the shares warmup learned", function()
+        local p = params()
+        p.warmup = 5
+        local ctx = analyzer.new(p)
+        local now = 0
+        for _ = 1, 20 do
+            now = now + 0.25
+            analyzer.run(ctx, sites(10), now, nil)
+        end
+        assert(ctx.baseline.warming)
+        -- Every site twenty times busier: the rate says attack, no share moved.
+        local big = sites(10)
+        for _, dim in ipairs({ "i4", "u", "h" }) do
+            for _, e in pairs(big[dim]) do
+                e.count = e.count * 20
+            end
+            big._totals[dim] = big._totals[dim] * 20
+        end
+        local snap
+        for _ = 1, 12 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, big, now, snap and snap.list)
+        end
+        assert(snap.mode == "attack", snap.mode)
+        assert(#snap.list == 0, "steady keys judged against 0: " .. #snap.list)
+    end)
+
+    it("ends a site decision when the surge ends, not a ttl later", function()
+        local p = params()
+        p.ttl_base = 600
+        p.ttl_max = 600
+        p.cooldown = 5
+        local ctx = analyzer.new(p)
+        local now = 0
+        local snap
+        for _ = 1, 80 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, sites(10), now, snap and snap.list)
+        end
+        for _ = 1, 12 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, sites(8000), now, snap and snap.list)
+        end
+        assert(find(snap.list, "victim.io"), "no site decision")
+        -- A little under the baseline, so the rate is plainly normal again.
+        for _ = 1, 120 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, sites(5), now, snap and snap.list)
+            if snap.mode == "normal" then
+                break
+            end
+        end
+        assert(snap.mode == "normal", snap.mode)
+        now = now + 0.25
+        snap = analyzer.run(ctx, sites(5), now, snap.list)
+        assert(find(snap.list, "victim.io") == nil, "site decision outlived the surge")
+    end)
+
+    it("does not judge a key on one sampled request", function()
+        local ctx = analyzer.new(params())
+        local one, three = "\10\9\9\1", "\10\9\9\3"
+        local function window(total, samples, a, b)
+            local w = empty()
+            w.i4[one] = { key = one, count = a, error = 0 }
+            w.i4[three] = { key = three, count = b, error = 0 }
+            w._totals.i4 = total
+            w._samples = { i4 = samples }
+            return w
+        end
+        local now = 1
+        analyzer.run(ctx, window(3000, 3000, 16, 16), now, nil)
+        local snap
+        for _ = 1, 8 do
+            now = now + 0.25
+            -- 600 rps at 1/16: nine samples, one key holds one, the other three.
+            snap = analyzer.run(ctx, window(150, 9, 16, 48), now, snap and snap.list)
+            assert(find(snap.list, one) == nil, "one sample was judged")
+        end
+        local rec = find(snap.list, three)
+        assert(rec and rec.action ~= "observe", "three samples were not judged")
+    end)
+
+    it("caps one address whose flood is already in its own baseline", function()
+        local p = params()
+        p.hard_ip_rps = 1000
+        local ctx = analyzer.new(p)
+        local function window()
+            local w = empty()
+            w.i4[attacker] = { key = attacker, count = 400, error = 0 }
+            w.i4[nat] = { key = nat, count = 100, error = 0 }
+            w._totals.i4 = 1000
+            return w
+        end
+        local snap
+        for i = 1, 8 do
+            snap = analyzer.run(ctx, window(), i * 0.25, snap and snap.list)
+        end
+        assert(snap.mode == "normal", snap.mode)
+        local rec = find(snap.list, attacker, "limit")
+        assert(rec and rec.reason == "hard_ip", "learned flood was not capped")
+        assert(find(snap.list, nat) == nil)
+    end)
+
+    it("does not let a steady offender learn itself out of its decision", function()
+        local ctx = analyzer.new(params())
+        local function window(a)
+            local w = empty()
+            w.i4[attacker] = { key = attacker, count = a, error = 0 }
+            w.i4[nat] = { key = nat, count = 30, error = 0 }
+            w._totals.i4 = 1000
+            return w
+        end
+        local now = 1
+        local snap = analyzer.run(ctx, window(5), now, nil)
+        -- Same total, so the rate stays normal and shares keep learning.
+        for _ = 1, 400 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, window(300), now, snap.list)
+        end
+        assert(snap.mode == "normal", snap.mode)
+        local rec = find(snap.list, attacker)
+        assert(rec and rec.action == "block", "offender learned its own share")
+        assert(find(snap.list, nat) == nil)
+    end)
+
+    it("does not scope a decision to the root path", function()
+        local ctx = analyzer.new(params())
+        local now = 0
+        for _ = 1, 40 do
+            now = now + 0.25
+            analyzer.run(ctx, quiet(), now, nil)
+        end
+        local window = flood()
+        window.u = { ["/"] = { key = "/", count = 8030, error = 0 } }
+        local snap
+        for _ = 1, 4 do
+            now = now + 0.25
+            snap = analyzer.run(ctx, window, now, snap and snap.list)
+        end
+        local rec = find(snap.list, attacker)
+        assert(rec, "no decision")
+        assert(rec.uri == nil, "scoped to " .. tostring(rec.uri))
+    end)
+
+    it("caps share history under a botnet that rotates addresses", function()
+        local ctx = analyzer.new(params())
+        local now = 1
+        for t = 1, 100 do
+            local w = empty()
+            for i = 1, 200 do
+                local ip = string.char(10, 3, t, i)
+                w.i4[ip] = { key = ip, count = 1, error = 0 }
+            end
+            w.i4[nat] = { key = nat, count = 100, error = 0 }
+            w._totals.i4 = 300
+            now = now + 0.25
+            analyzer.run(ctx, w, now, nil)
+        end
+        local n = 0
+        for _ in pairs(ctx.shares) do
+            n = n + 1
+        end
+        assert(n <= 8192, n .. " share entries")
+        assert(ctx.shares["i4\0" .. nat], "the steady key was evicted")
     end)
 
     it("keeps confidence when a block is adopted from the snapshot", function()

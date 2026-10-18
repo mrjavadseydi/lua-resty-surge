@@ -31,6 +31,21 @@ local function tracker(params)
     return entropy.new_tracker(params.half_life, params.tick)
 end
 
+-- Sampled requests one entropy reading needs. At 128 the reading of a
+-- steady mix moves by about 0.06, well inside a 0.15-0.25 threshold.
+local ENTROPY_SAMPLES = 128
+local MIN_KEY_SAMPLES = 2
+-- Share history entries kept, about 1 MB of saved JSON.
+local MAX_SHARES = 8192
+
+local function ent_acc()
+    local out = {}
+    for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
+        out[dim] = { map = {}, total = 0, samples = 0, ticks = 0 }
+    end
+    return out
+end
+
 function _M.new(params, incident_prefix)
     return {
         params = params,
@@ -50,6 +65,7 @@ function _M.new(params, incident_prefix)
             u = tracker(params),
             f = tracker(params),
         },
+        ent_acc = ent_acc(),
         shares = {},
         share_at = {},
         states = {},
@@ -76,6 +92,29 @@ function _M.restore(ctx, snap, now)
         ctx.baseline.started_at = now
         ctx.baseline.mode = "normal"
         ctx.baseline.below_since = nil
+    end
+end
+
+local function dim_of(rec)
+    if rec.family == "fp" then
+        return "f"
+    end
+    if rec.family == "host" then
+        return "h"
+    end
+    if rec.bits == 24 then
+        return "s4"
+    end
+    if rec.bits == 64 or rec.family == "v6" then
+        return "s6"
+    end
+    return "i4"
+end
+
+-- An operator removed this decision. Its key's escalation starts over.
+function _M.forget(ctx, rec)
+    if ctx and rec and rec.key then
+        ctx.states[dim_of(rec) .. "\0" .. rec.key] = nil
     end
 end
 
@@ -144,16 +183,35 @@ function _M.run(ctx, merged, now, previous)
     local entropy_ready = 1 - exp(-p.warmup / p.half_life)
     local entropy_info = {}
     local entropy_bad = false
+    local samples = merged._samples or totals
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
+        -- Windows are pooled until they hold ENTROPY_SAMPLES sampled
+        -- requests. Nine samples (600 rps at 1/16) read 0.96 on a mix
+        -- whose entropy is 0.85, and swing past any drop threshold.
+        local acc = ctx.ent_acc[dim]
+        if (totals[dim] or 0) > 0 then
+            for k, e in pairs(merged[dim] or {}) do
+                acc.map[k] = (acc.map[k] or 0) + e.count
+            end
+            acc.total = acc.total + totals[dim]
+            acc.samples = acc.samples + (samples[dim] or 0)
+            acc.ticks = acc.ticks + 1
+        end
         -- An empty window is "no data", not entropy 0.
         -- Learning 0 makes the next real mix look
         -- like an attack, and attack then freezes that 0 forever.
-        if (totals[dim] or 0) <= 0 then
+        if acc.samples < ENTROPY_SAMPLES then
             entropy_info[dim] = {
                 h = nil, base = ctx.entropy[dim]:mean(), delta = 0,
             }
         else
-            local h = entropy.normalized(histogram(merged[dim], totals[dim]))
+            local counts = {}
+            for k, c in pairs(acc.map) do
+                counts[k] = { count = c }
+            end
+            local h = entropy.normalized(histogram(counts, acc.total))
+            entropy_info[dim] = { ticks = acc.ticks }
+            acc.map, acc.total, acc.samples, acc.ticks = {}, 0, 0, 0
             local base = ctx.entropy[dim]:mean()
             local delta = 0
             if base and ctx.entropy[dim]:weight() >= entropy_ready then
@@ -166,11 +224,17 @@ function _M.run(ctx, merged, now, previous)
                     entropy_bad = true
                 end
             end
-            entropy_info[dim] = { h = h, base = base or h, delta = delta }
+            local info = entropy_info[dim]
+            info.h, info.base, info.delta = h, base or h, delta
         end
     end
 
-    local mode = baseline.update(ctx.baseline, rps, now, entropy_bad)
+    local mode, lines = baseline.update(ctx.baseline, rps, now, entropy_bad)
+    -- Warmup has no frozen mode, so a tick over the elevated line teaches no
+    -- shares. A flood's first partial tick, under the attack line the rate
+    -- hold uses, would otherwise seed its key a floor it never reaches.
+    local loud = ctx.baseline.held
+        or (ctx.baseline.warming and ctx.baseline.var > 0 and rps > lines.elev)
     local warming = ctx.baseline.warming
     local frozen = mode ~= "normal"
     for _, dim in ipairs({ "s4", "s6", "u", "f" }) do
@@ -178,12 +242,12 @@ function _M.run(ctx, merged, now, previous)
         if h ~= nil then
             -- Warmup learns entropy too, except on a tick the rate held.
             local freeze = frozen or ctx.baseline.held
-            -- Elevated is when fingerprints are first visible. That mix is
+            -- Elevated mode keeps learning the fingerprint mix, which is
             -- the reference. Freeze it only once the mode is attack.
             if dim == "f" and mode == "elevated" then
                 freeze = false
             end
-            ctx.entropy[dim]:update(h, freeze)
+            ctx.entropy[dim]:update(h, freeze, entropy_info[dim].ticks)
         end
     end
 
@@ -193,7 +257,9 @@ function _M.run(ctx, merged, now, previous)
     local uri_scope = nil
     local uri_total = totals.u or 0
     local uri_key, uri_count = top_key(merged.u)
-    if uri_key and uri_total > 0 and (uri_count / uri_total) >= 0.4 then
+    -- Scope is a path prefix, and "/" prefixes every path: scoping to it
+    -- only kept the decision out of the export and early().
+    if uri_key and uri_key ~= "/" and uri_total > 0 and (uri_count / uri_total) >= 0.4 then
         local drop = entropy_info.u and entropy_info.u.delta or 0
         if drop <= -p.entropy_drop or (uri_count / uri_total) >= 0.5 then
             uri_scope = uri_key
@@ -215,22 +281,6 @@ function _M.run(ctx, merged, now, previous)
     local emitted = {}
     local manual_ids = {}
     local from_prev = {}
-
-    local function dim_of(rec)
-        if rec.family == "fp" then
-            return "f"
-        end
-        if rec.family == "host" then
-            return "h"
-        end
-        if rec.bits == 24 then
-            return "s4"
-        end
-        if rec.bits == 64 or rec.family == "v6" then
-            return "s6"
-        end
-        return "i4"
-    end
 
     local function adopt(rec)
         local id = dim_of(rec) .. "\0" .. rec.key
@@ -287,7 +337,7 @@ function _M.run(ctx, merged, now, previous)
         if meta.family == "fp" then
             label = fingerprint.short(key)
         elseif not is_host then
-            label = messages.label(key, meta.bits)
+            label = messages.label(key, meta.bits, meta.family == "v6")
         end
         -- The limit stage caps a site at about twice its normal traffic,
         -- not at the per-client limit_rps.
@@ -335,6 +385,8 @@ function _M.run(ctx, merged, now, previous)
         if total <= 0 then
             return
         end
+        -- Sampled requests per counted request in this dimension.
+        local per = (samples[dim] or total) / total
         for key, e in pairs(map) do
             local id = dim .. "\0" .. key
             touched[id] = true
@@ -344,6 +396,9 @@ function _M.run(ctx, merged, now, previous)
             if p.tick > 0 then
                 rate = e.count / p.tick
             end
+            -- One sampled request at 1/16 reads as 64 rps and a tenth of a
+            -- small window. A key is judged only on two or more.
+            local sampled = e.count * per >= MIN_KEY_SAMPLES
             ctx.share_at[id] = now
             local st = ctx.states[id]
             if st then
@@ -351,11 +406,21 @@ function _M.run(ctx, merged, now, previous)
             end
 
             -- Judge against the baseline from before this tick. Seeding a
-            -- brand-new key is not an offense. Fingerprints are only sampled
-            -- once the mode has left normal, so elevated traffic is their
-            -- baseline. Attack must not teach a bot's share as normal.
+            -- brand-new key is not an offense. Fingerprints also learn in
+            -- elevated mode. Attack must not teach a bot's share as normal.
             local seeded_now = false
-            local learn = not hard_only and not warming
+            local floor = math.max(p.abs_share, (base or 0) * p.multiplier)
+            -- Warmup learns shares too, except on a tick the rate held.
+            -- Judging starts at its end, against a baseline for every key
+            -- seen so far instead of 0. A key over its floor, or under a
+            -- live decision, is not learned: a steady flood would otherwise
+            -- raise its own floor past itself within minutes.
+            local learn = not loud
+            -- A host is judged on its rise, not on this floor.
+            local over = dim ~= "h" and share > floor
+            if base ~= nil and (over or (st and st.stage ~= "observe")) then
+                learn = false
+            end
             if dim == "f" then
                 if mode == "attack" then
                     learn = false
@@ -386,7 +451,7 @@ function _M.run(ctx, merged, now, previous)
                 -- count. A host first seen during a surge is judged against 0.
                 local rise = p.host_share_rise or 0.25
                 if not warming and mode ~= "normal" and rate > p.min_key_rps
-                    and share - (base or 0) >= rise
+                    and sampled and share - (base or 0) >= rise
                 then
                     if not st then
                         st = escalation.new(incident(ctx))
@@ -403,14 +468,21 @@ function _M.run(ctx, merged, now, previous)
                     escalation.step(st, true, conf, p, now, "challenge")
                     emit(id, st, key, meta, share, base, rate, "host_surge")
                 elseif st then
+                    -- The surge is over: the site decision ends with it,
+                    -- not ttl_base later.
+                    if mode == "normal" then
+                        st.until_ts = now
+                    end
                     escalation.step(st, false, 0, p, now, nil)
                     hold(id, st)
                 end
-            elseif hard_only and dim == "i4" and p.hard_ip_rps
-                and rate > p.hard_ip_rps
+            elseif dim == "i4" and p.hard_ip_rps and rate > p.hard_ip_rps
+                and (hard_only or share <= floor)
             then
-                -- Warmup has no share baseline. Cap one IPv4 address, not a
-                -- subnet total: a /24 over the same number is a busy NAT.
+                -- Warmup has no share baseline. After it, a flood that was
+                -- already running is in its own baseline. Either way cap one
+                -- IPv4 address, not a subnet total: a /24 over the same
+                -- number is a busy NAT.
                 if not st then
                     st = escalation.new(incident(ctx))
                     ctx.states[id] = st
@@ -424,9 +496,8 @@ function _M.run(ctx, merged, now, previous)
                 st.last_seen = now
                 emit(id, st, key, meta, share, base, rate, "hard_ip")
             elseif not hard_only and not seeded_now and not warming
-                and rate > p.min_key_rps
+                and rate > p.min_key_rps and sampled
             then
-                local floor = math.max(p.abs_share, (base or 0) * p.multiplier)
                 if share > floor then
                     if not st then
                         st = escalation.new(incident(ctx))
@@ -477,10 +548,29 @@ function _M.run(ctx, merged, now, previous)
             ctx.states[id] = nil
         end
     end
+    local kept = 0
     for id, seen_at in pairs(ctx.share_at) do
         if now - seen_at > idle_after and not ctx.states[id] then
             ctx.shares[id] = nil
             ctx.share_at[id] = nil
+        else
+            kept = kept + 1
+        end
+    end
+    -- A botnet that rotates addresses leaves a share behind per address,
+    -- and the whole table is saved every second. Past the cap, the keys
+    -- seen longest ago go first; a live decision keeps its key.
+    if kept > MAX_SHARES then
+        local old = {}
+        for id, seen_at in pairs(ctx.share_at) do
+            if not ctx.states[id] then
+                old[#old + 1] = { id, seen_at }
+            end
+        end
+        table.sort(old, function(a, b) return a[2] < b[2] end)
+        for i = 1, math.min(#old, kept - math.floor(MAX_SHARES * 0.9)) do
+            ctx.shares[old[i][1]] = nil
+            ctx.share_at[old[i][1]] = nil
         end
     end
 

@@ -55,6 +55,8 @@ describe("config", function()
             {sketch_width=3}, {sketch_width=1000}, {sketch_depth=3},
             {challenge_ready=1}, {test_hooks="true"}, {abs_share=2},
             {ttl_max=1}, {k_attack=1},
+            {pow_bits=64}, {chal_ignore=1}, {tick=0.001}, {half_life=0.0001},
+            {abs_share=0}, {entropy_drop=0}, {host_share_rise=0},
         }
         for _, advanced in ipairs(invalid) do
             assert(not pcall(config.parse, {advanced=advanced}))

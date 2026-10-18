@@ -19,6 +19,13 @@ describe("client address", function()
         assert(not ip.matches(rule, v4(10, 2, 20, 1)))
     end)
 
+    it("clears host bits so a network has one form", function()
+        assert(ip.parse_cidr("10.1.2.3/24").bin == v4(10, 1, 2, 0))
+        assert(ip.parse_cidr("10.1.31.9/20").bin == v4(10, 1, 16, 0))
+        assert(ip.parse_cidr("10.1.2.3/32").bin == v4(10, 1, 2, 3))
+        assert(ip.parse_cidr("2001:db8::1/64").bin == ip.parse_cidr("2001:db8::").bin)
+    end)
+
     it("parses compressed ipv6 and a /32", function()
         local rule = ip.parse_cidr("2001:db8::/32")
         local inside = ip.parse_cidr("2001:db8:1::1")

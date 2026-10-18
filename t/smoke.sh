@@ -104,6 +104,8 @@ http {
                         ["i4\\0" .. string.char(200,1,2,3)]=now },
                 }
                 assert(ngx.shared.surge:safe_set("analyzer", require("cjson").encode(snap)))
+                -- The leader re-reads the snapshot only when this moves.
+                ngx.shared.surge:incr("analyzer_v", 1, 0)
                 ngx.shared.surge:set("smoke:history", true)
                 ngx.say("seeded")
             }
@@ -116,6 +118,29 @@ http {
                     { cidr = "127.0.0.1/32", action = "limit",
                       reason = "heavy_hitter", manual = false },
                 })
+                if ok then
+                    local ch = require "resty.surge.challenge"
+                    local d = ngx.shared.surge
+                    local value = ch.issue(ngx.var.binary_remote_addr, ngx.now(),
+                        120, 8, d:get("pow:ver"), d:get("pow:cur"))
+                    ngx.header["Set-Cookie"] = ch.cookie_header(value, 120, false)
+                end
+                ngx.say(ok and "published" or err)
+            }
+        }
+
+        # Heavy-hitter blocks on the /24, and on the /32 too with ?own=1.
+        location = /_hh {
+            content_by_lua_block {
+                local list = {
+                    { cidr = "127.0.0.0/24", action = "block",
+                      reason = "heavy_hitter", manual = false },
+                }
+                if ngx.var.arg_own then
+                    list[2] = { cidr = "127.0.0.1/32", action = "block",
+                        reason = "heavy_hitter", manual = false }
+                end
+                local ok, err = require("resty.surge")._publish(list)
                 if ok then
                     local ch = require "resty.surge.challenge"
                     local d = ngx.shared.surge
@@ -208,6 +233,23 @@ echo "$page" | grep -qi "Content-Type: text/html" || fail "dashboard type" "$PRE
 echo "$page" | grep -qi "Content-Security-Policy: default-src 'none'" || fail "dashboard csp" "$PREFIX"
 echo "$page" | grep -q "<title>surge status</title>" || fail "dashboard body" "$PREFIX"
 
+# A solved cookie passes a heavy-hitter /24, not a block on its own /32.
+hh_cookie() {
+    curl -sf -D - "http://127.0.0.1:$PORT/_hh$1" \
+        | awk 'tolower($1)=="set-cookie:" { print $2 }' | tr -d '\r' | cut -d';' -f1
+}
+cookie=$(hh_cookie "")
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $cookie" "http://127.0.0.1:$PORT/")
+[ "$code" = "200" ] || fail "cookie did not pass a /24 heavy-hitter block ($code)" "$PREFIX"
+cookie=$(hh_cookie "?own=1")
+sleep 0.8
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $cookie" "http://127.0.0.1:$PORT/")
+[ "$code" = "403" ] || fail "cookie passed a block on its own address ($code)" "$PREFIX"
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.0/24" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT/_surge?unblock=127.0.0.1" >/dev/null
+sleep 0.8
+
 # A solved cookie cannot bypass a manual /24 through an automatic /32 limit.
 hdr=$(curl -sf -D - "http://127.0.0.1:$PORT/_overlap") || fail "overlap publish" "$PREFIX"
 cookie=$(printf '%s\n' "$hdr" | awk 'tolower($1)=="set-cookie:" { print $2 }' \
@@ -275,6 +317,17 @@ done
 # Block and unblock by address. Both go through the leader's queue.
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/_surge?block=bad")
 [ "$code" = "400" ] || fail "bad cidr was accepted ($code)" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/_surge?block=0.0.0.0/0")
+[ "$code" = "400" ] || fail "a /0 block was accepted ($code)" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Origin: https://evil.example' \
+    "http://127.0.0.1:$PORT/_surge?block=127.0.0.77")
+[ "$code" = "403" ] || fail "cross-site POST was accepted ($code)" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Sec-Fetch-Site: cross-site' \
+    "http://127.0.0.1:$PORT/_surge?block=127.0.0.77")
+[ "$code" = "403" ] || fail "cross-site fetch was accepted ($code)" "$PREFIX"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: http://127.0.0.1:$PORT" \
+    -H 'Sec-Fetch-Site: same-origin' "http://127.0.0.1:$PORT/_surge?unblock=none")
+[ "$code" = "404" ] || fail "same-origin unblock of nothing ($code)" "$PREFIX"
 curl -sf -X POST "http://127.0.0.1:$PORT/_surge?block=127.0.0.1&ttl=60" | grep -q '"op":"block"' \
     || fail "block by address" "$PREFIX"
 sleep 0.8
@@ -399,33 +452,41 @@ while [ "$i" -lt 12 ]; do
         "http://127.0.0.1:$PORT/"
     i=$((i + 1))
 done
-# A solve takes one page back. 1 page so far, minus 1, plus 9 stays under 10.
+# An address that solved is a NAT with a real browser behind it: its
+# unsolved pages (a feed reader next to that browser) no longer count.
 set -- $(curl -sf "http://127.0.0.1:$PORT/_pow")
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
     "http://127.0.0.1:$PORT/?srg_ch=$1&srg_pow=$2")
 [ "$code" = "204" ] || fail "solve was not accepted ($code)" "$PREFIX"
 i=0
-while [ "$i" -lt 9 ]; do
+while [ "$i" -lt 12 ]; do
     curl -s -o /dev/null -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
     i=$((i + 1))
 done
 sleep 0.8
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/" || true)
 [ "$code" = "200" ] || fail "blocked despite fetches and a solve ($code)" "$PREFIX"
-curl -s -o /dev/null -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
+# An address that never solved: ten pages and it is blocked.
+B=127.0.0.2
+i=0
+while [ "$i" -lt 10 ]; do
+    curl -s -o /dev/null --interface $B -H 'Host: victim.test' "http://127.0.0.1:$PORT/"
+    i=$((i + 1))
+done
 sleep 0.8
 # A bot that ignored the page gets a closed socket (444), not a body.
-code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: other.test' "http://127.0.0.1:$PORT/" || true)
+code=$(curl -s -o /dev/null -w '%{http_code}' --interface $B -H 'Host: other.test' \
+    "http://127.0.0.1:$PORT/" || true)
 [ "$code" = "000" ] || fail "ignored challenge not closed ($code)" "$PREFIX"
 curl -sf "http://127.0.0.1:$PORT/_surge" | grep -q '"reason":"challenge_ignored"' \
     || fail "block reason missing from status" "$PREFIX"
-grep -q "^v4 32 127.0.0.1 " "$PREFIX/export/blocks.txt" || fail "block not exported" "$PREFIX"
-grep -q "surge: Blocked 127.0.0.1: ignored the challenge page" "$PREFIX/logs/error.log" \
+grep -q "^v4 32 $B " "$PREFIX/export/blocks.txt" || fail "block not exported" "$PREFIX"
+grep -q "surge: Blocked $B: ignored the challenge page" "$PREFIX/logs/error.log" \
     || fail "challenge_ignored block not logged" "$PREFIX"
-grep -q "surge-hook: block 127.0.0.1 challenge_ignored" "$PREFIX/logs/error.log" \
+grep -q "surge-hook: block $B challenge_ignored" "$PREFIX/logs/error.log" \
     || fail "on_decision not called for challenge_ignored" "$PREFIX"
 # The script path is not a way around a block while a challenge is live.
-code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: victim.test' \
+code=$(curl -s -o /dev/null -w '%{http_code}' --interface $B -H 'Host: victim.test' \
     "http://127.0.0.1:$PORT/.srg-pow.v1.js" || true)
 [ "$code" = "000" ] || fail "blocked address got the script ($code)" "$PREFIX"
 

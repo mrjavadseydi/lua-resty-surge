@@ -35,6 +35,9 @@ local agent_on = false
 local an
 local on_merged
 local started = false
+-- Why start() refused to run. nginx keeps serving after an init_worker
+-- error, unprotected, so status() reports it instead of "not started".
+local start_err
 local bench_mode
 local cfg
 local state
@@ -44,6 +47,11 @@ local sample_n = 0
 local seen_n = 0
 local sig = ""
 local analyzer_saved = ""
+-- "analyzer_v" in the dict when this worker last saved or restored it, and
+-- when it last saved. The snapshot can be hundreds of KB: it is encoded at
+-- most once a second, and a tick copies it out only when the version moved.
+local analyzer_ver, analyzer_saved_at = nil, 0
+local SAVE_EVERY = 1
 local incident_prefix
 local shared
 local feed_rt = {
@@ -351,7 +359,7 @@ local function view_of(r, now)
         reason = r.reason,
         target = (r.family == "fp" and fingerprint.short(r.key))
             or (r.family == "host" and r.key)
-            or messages.label(r.key or "", r.bits),
+            or messages.label(r.key or "", r.bits, r.family == "v6"),
         uri = r.uri,
         message = r.message,
         ttl = r.ttl,
@@ -621,12 +629,22 @@ local function apply_ops(now)
                     ttl = ttl,
                     close = true,
                     reason = "challenge_ignored",
-                    message = "Blocked " .. messages.label(rule.bin, rule.bits)
+                    message = "Blocked " .. messages.label(rule.bin, rule.bits, rule.v6)
                         .. ": ignored the challenge page",
                 }, rule, now)
                 changed = true
             end
         elseif kind == "b" and rule then
+            -- A second block of the same network replaces the first: its
+            -- ttl is the one the operator just asked for.
+            local keep = {}
+            for i = 1, #list do
+                local r = list[i]
+                if not (r.manual and r.reason == "manual" and same_net(r, rule)) then
+                    keep[#keep + 1] = r
+                end
+            end
+            list = keep
             list[#list + 1] = manual_record({ ttl = ttl }, rule, now)
             changed = true
         elseif kind == "u" then
@@ -634,7 +652,10 @@ local function apply_ops(now)
             for i = 1, #list do
                 local r = list[i]
                 if r.incident == arg or (rule and r.family ~= "fp" and same_net(r, rule)) then
-                    dict:set("supk:" .. r.family .. ":" .. r.key, 1, ttl)
+                    -- The key starts over at observe. No immunity: a key
+                    -- still flooding is limited again after `consecutive`
+                    -- ticks. An exemption is what `allow` is for.
+                    analyzer.forget(an, r)
                 else
                     keep[#keep + 1] = r
                 end
@@ -654,6 +675,10 @@ local unpublished_old
 local merging = false
 
 local function restore_analyzer()
+    local ver = state.dict:get("analyzer_v")
+    if ver ~= nil and ver == analyzer_ver then
+        return
+    end
     local saved = state.dict:get("analyzer")
     if type(saved) == "string" then
         if saved ~= analyzer_saved then
@@ -663,6 +688,7 @@ local function restore_analyzer()
                 analyzer_saved = saved
             end
         end
+        analyzer_ver = ver
     elseif analyzer_saved == "" then
         local prior = baseline.import(state.dict:get("baseline"))
         if prior then
@@ -681,16 +707,6 @@ local function merge(merged)
     -- on the lease. Continue from that snapshot instead of overwriting it.
     restore_analyzer()
     local snap = analyzer.run(an, merged, ngx.now(), box.list)
-    local kept = {}
-    local list = snap.list or {}
-    for i = 1, #list do
-        local r = list[i]
-        local banned = state.dict:get("supk:" .. (r.family or "") .. ":" .. (r.key or ""))
-        if r.manual or not banned then
-            kept[#kept + 1] = r
-        end
-    end
-    snap.list = kept
     if not bench_mode and snap.mode ~= box.mode then
         ngx.log(ngx.NOTICE, string.format(
             "surge: mode %s, rps %.0f, baseline %.0f",
@@ -726,6 +742,11 @@ local function merge(merged)
     -- The next start() continues this clock. Otherwise every reload spends
     -- the whole warmup with no automatic decisions.
     -- Rate and share history must survive together, including binary IP keys.
+    local now = ngx.now()
+    if now - analyzer_saved_at < SAVE_EVERY then
+        return
+    end
+    analyzer_saved_at = now
     local text, encode_err = cjson.encode(analyzer.snapshot(an))
     if not text then
         ngx.log(ngx.ERR, "surge: baseline encode failed: ", encode_err or "")
@@ -735,6 +756,7 @@ local function merge(merged)
         local ok, berr = state.dict:safe_set("analyzer", text)
         if ok then
             analyzer_saved = text
+            analyzer_ver = state.dict:incr("analyzer_v", 1, 0)
         else
             ngx.log(ngx.ERR, "surge: baseline save failed: ", berr or "")
         end
@@ -889,12 +911,22 @@ local pass_cache = require("resty.lrucache").new(20000)
 local PASS_TTL = 30
 
 -- Decisions a solved challenge cookie lets a browser through. A site-wide
--- challenge, manual or not, exists to be solved.
+-- challenge, manual or not, exists to be solved. On a /24 or a fingerprint
+-- the solver is one of many behind the key, so every stage is skipped. On
+-- the client's own address (/32, or the /64) only the challenge is: that
+-- address is the flood itself, and one solve must not buy it an unlimited
+-- rate through its own limit or block.
 local function skippable(dec)
     if dec.family == "host" then
         return true
     end
-    return not dec.manual and dec.reason == "heavy_hitter"
+    if dec.manual or dec.reason ~= "heavy_hitter" then
+        return false
+    end
+    if dec.action == "challenge" or dec.family == "fp" then
+        return true
+    end
+    return (dec.bits or 0) < (dec.family == "v6" and 64 or 32)
 end
 
 -- Count unsolved challenge pages per address across workers. At
@@ -902,7 +934,9 @@ end
 -- early() and the nftables export then pick up. Only navigations count:
 -- a browser's fetch, image or script (Sec-Fetch-Dest set, not "document")
 -- cannot run the page, so it is not ignoring it. A solve takes one back,
--- so a NAT of real users solving does not add up to a block.
+-- so a NAT of real users solving does not add up to a block. An address
+-- that solved at all is not counted for pow_ttl: a feed reader or curl
+-- behind the same NAT ignoring the page must not block its browsers.
 -- a bot that sends Sec-Fetch-Dest: empty is never counted. It
 -- still only ever gets the page; the block just saves the bytes.
 local function note_page(bin)
@@ -914,6 +948,9 @@ local function note_page(bin)
     if dest and dest ~= "document" then
         return
     end
+    if shared:get("cs:" .. bin) then
+        return
+    end
     local n = shared:incr("cf:" .. bin, 1, 0, 10)
     if n == limit then
         shared:rpush("ops", "c\0" .. sha.hex(bin) .. "\0" .. cfg.params.ttl_base)
@@ -921,8 +958,12 @@ local function note_page(bin)
 end
 
 local function note_solved(bin)
+    if not shared then
+        return
+    end
+    shared:set("cs:" .. bin, true, cfg.params.pow_ttl or 1200)
     local key = "cf:" .. bin
-    local n = shared and shared:get(key)
+    local n = shared:get(key)
     if n and n > 0 then
         shared:incr(key, -1)
     end
@@ -1130,15 +1171,14 @@ local function protect_inner()
             .. " " .. (listed.reason or ""))
     end
 
-    -- Header reads stay off the normal path. Attack mode and an existing
-    -- fingerprint decision need the key on every request; elevated mode
-    -- otherwise fingerprints only the sampled requests.
+    -- A live fingerprint decision needs the key on every request. Otherwise
+    -- only the sampled requests are counted, so only those are built. Normal
+    -- mode samples them too: a spike that goes straight to attack would
+    -- otherwise meet its own browsers' fingerprints for the first time.
     local want_fp = false
     if cfg.test_hooks and ngx.var.arg_surge_fp == "1" then
         want_fp = true
-    elseif (box.fp_n or 0) > 0 or (box.mode ~= "normal" and due_sample()) then
-        -- A live fingerprint decision needs every request. Otherwise only
-        -- the sampled ones are counted, so only those are built.
+    elseif (box.fp_n or 0) > 0 or due_sample() then
         want_fp = true
     end
     local fp_key
@@ -1170,17 +1210,17 @@ local function protect_inner()
     -- A heavy-hitter block is enforced here, not in early(), so this cookie
     -- can still let a solved browser through.
     local out, extra = apply_dec(dec, bin, pass)
-    if out then
-        return out, extra
+    if not out then
+        out, extra = apply_dec(fpdec, bin, pass)
     end
-    out, extra = apply_dec(fpdec, bin, pass)
-    if out then
-        return out, extra
+    if not out then
+        out, extra = apply_dec(hostdec, bin, pass)
     end
-    out, extra = apply_dec(hostdec, bin, pass)
     if out then
-        -- A site cap must not hide the flood it caps: the analyzer judges
-        -- the host by its share, and a capped share looks like it ended.
+        -- A denied request is counted like any other. A capped or
+        -- challenged key that vanished from the sketches would look like
+        -- it stopped: its challenge could never become a block, and the
+        -- rate would read normal in the middle of the flood.
         if out ~= "solved" then
             observe(family, bin, fp_key)
         end
@@ -1380,7 +1420,12 @@ function _M.start(opts)
             .. phase .. ")")
     end
 
-    cfg = config.parse(opts)
+    local ok_cfg, parsed = pcall(config.parse, opts)
+    if not ok_cfg then
+        start_err = tostring(parsed)
+        error(parsed, 0)
+    end
+    cfg = parsed
     cfg.params.api_prefixes = cfg.api
     if config.needs_agent(cfg.feeds) and not agent_on then
         error("surge: url feeds need the privileged agent. Add this in the http {} block:\n"
@@ -1576,6 +1621,27 @@ function _M.early()
     return ngx.exit(ngx.ERROR)
 end
 
+-- Any page the operator visits can make their browser POST here, and this
+-- location is usually guarded by network only. A browser names the
+-- request's origin on a POST, so refuse one from another site. curl and
+-- scripts send neither header.
+local function same_origin()
+    local site = ngx.var.http_sec_fetch_site
+    if site and site ~= "same-origin" and site ~= "none" then
+        return false
+    end
+    local origin = ngx.var.http_origin
+    if not origin then
+        return true
+    end
+    local host = origin:match("^%a[%w+.-]*://([^/]+)$")
+    return host ~= nil and host:lower() == (ngx.var.http_host or ""):lower()
+end
+
+-- A block wider than this takes a whole region of the internet off the
+-- node, kernel included once exported.
+local MIN_BLOCK_BITS = { v4 = 8, v6 = 16 }
+
 function _M.status()
     if ngx.var.arg_format == "html" then
         local dashboard = require "resty.surge.dashboard"
@@ -1587,11 +1653,18 @@ function _M.status()
     ngx.header["Content-Type"] = "application/json"
     if not started or not box then
         ngx.status = 500
-        ngx.print('{"error":"surge not started"}')
+        ngx.print(cjson.encode({ error = start_err
+            and ("surge config rejected, requests are not protected: " .. start_err)
+            or "surge not started" }))
         return
     end
 
     if ngx.req.get_method() == "POST" and state then
+        if not same_origin() then
+            ngx.status = 403
+            ngx.print('{"ok":false,"error":"cross-site request"}')
+            return
+        end
         local unblock = ngx.var.arg_unblock
         local blockip = ngx.var.arg_block
         local ttl = tonumber(ngx.var.arg_ttl)
@@ -1602,10 +1675,29 @@ function _M.status()
         end
         local op, name
         if unblock and unblock ~= "" then
-            -- An incident id, or the exact address/CIDR of a decision.
+            -- An incident id, or the exact address/CIDR of a decision. This
+            -- worker's copy of the list is at most a tick old.
+            local rule = clientip.parse_cidr(unblock)
+            local found = false
+            local list = box.list or {}
+            for i = 1, #list do
+                local r = list[i]
+                if r.incident == unblock or (rule and r.family ~= "fp" and same_net(r, rule)) then
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                ngx.status = 404
+                ngx.print('{"ok":false,"error":"no such decision"}')
+                return
+            end
             op, name = "u\0" .. unblock .. "\0" .. ttl, "unblock"
         elseif blockip and blockip ~= "" then
             local rule, err = clientip.parse_cidr(blockip)
+            if rule and rule.bits < MIN_BLOCK_BITS[rule.v6 and "v6" or "v4"] then
+                rule, err = nil, "prefix wider than /" .. MIN_BLOCK_BITS[rule.v6 and "v6" or "v4"]
+            end
             if not rule then
                 ngx.status = 400
                 ngx.print(cjson.encode({ ok = false, error = err }))
@@ -1713,7 +1805,8 @@ function _M._publish(items, mode)
         local it = items[i]
         if it.host then
             -- ngx.var.host is always lowercase.
-            local rec = manual_record(it, { bin = it.host:lower(), bits = 0 }, now)
+            -- Cut like host_key() cuts the request's Host, or it never matches.
+            local rec = manual_record(it, { bin = it.host:lower():sub(1, 128), bits = 0 }, now)
             rec.family = "host"
             list[#list + 1] = rec
         else
